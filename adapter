@@ -1,0 +1,20 @@
+set_config() {
+cat << EOF > /tmp/wpa_supplicant.conf
+network={
+        mode=2
+        frequency=$(fw_printenv -n wlanfreq || echo 2412)
+        ssid="$(fw_printenv -n wlanssid || echo OpenIPC)"
+        key_mgmt=NONE
+}
+EOF
+
+
+iw wlan0 set txpower auto
+# Setting AP settings for reduced delay
+iw phy  phy0  set distance 0
+iw phy  phy0  set coverage 0
+iw phy  phy0  set retry  short 4  long 4
+iw phy  phy0  set rts off
+
+
+}
