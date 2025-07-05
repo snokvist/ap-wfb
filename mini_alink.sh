@@ -1,5 +1,4 @@
 #!/bin/sh
-# linkwatch-ultra-param.sh
 #  • 4 096 / 10 240 kbit/s two-rate controller
 #  • RSSI_PANIC  – drop to MIN when signal ≤ value
 #  • RETRY_CLAMP – drop to MIN when avg-retry ≥ value
