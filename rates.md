@@ -10,7 +10,7 @@ echo 0xFFFFFFFF > /proc/net/rtl8733bu/wlan0/rate_ctl
 
 Everything in between 0F-FF defaults to legacy 6mbit
 MCS3: 
-26 Mbit/s, 20 MHz, MCS 3
+26 Mbit/s, 20 MHz, MCS 3 (supposed to be autoselect MCS0-3 need to test)
 echo 0x0000000F > /proc/net/rtl8733bu/wlan0/rate_ctl
 
 26 Mbit/s, 20 MHz, MCS 3
@@ -22,7 +22,7 @@ echo 0x0000008F > /proc/net/rtl8733bu/wlan0/rate_ctl
 28.9 Mbit/s, 20 MHz, MCS 3, Short GI
 echo 0x000000CF > /proc/net/rtl8733bu/wlan0/rate_ctl
 
-72.2 Mbit/s, 20 MHz, MCS 7, Short GI 
+72.2 Mbit/s, 20 MHz, MCS 7, Short GI (Autoselect 0-7)
 echo 0x000000FF > /proc/net/rtl8733bu/wlan0/rate_ctl
 
 
