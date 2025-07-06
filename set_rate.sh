@@ -56,21 +56,9 @@ case "$1" in
         echo "Allowing up to MCS7 (72 Mb/s)..."
         echo 0x000000FF > $MASK_FILE
         ;;
-    leg36)
-        echo "Locking to legacy 36 Mb/s..."
-        echo 0x000000C9 > $MASK_FILE
-        ;;
-    leg48)
-        echo "Locking to legacy 48 Mb/s..."
-        echo 0x000000CA > $MASK_FILE
-        ;;
-    leg54)
-        echo "Locking to legacy 54 Mb/s..."
-        echo 0x000000CB > $MASK_FILE
-        ;;
     *)
         echo "Usage: $0 <mode>"
-        echo "Modes: reset mcs0 mcs1 mcs2 mcs3 mcs0-3 mcs0-3-sgi mcs7 leg36 leg48 leg54"
+        echo "Modes: reset mcs0 mcs1 mcs2 mcs3 mcs0-3 mcs0-3-sgi mcs7"
         exit 1
         ;;
 esac
