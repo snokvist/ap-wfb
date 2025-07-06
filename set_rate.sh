@@ -15,9 +15,6 @@
 #   mcs0-3       -> autoselect up to MCS3 long GI
 #   mcs0-3-sgi   -> autoselect up to MCS3 short GI
 #   mcs7         -> full HT up to MCS7 (72 Mb/s)
-#   leg36        -> lock to legacy 36 Mb/s
-#   leg48        -> lock to legacy 48 Mb/s
-#   leg54        -> lock to legacy 54 Mb/s
 #
 # ---------------------------------------------------------
 
