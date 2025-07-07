@@ -1,18 +1,19 @@
 /*
  * rtp_merge.c — RTP duplicate-stream merger
  *               · bitmap dedup (4 k-pkt sliding window, O(1))
- *               · batched RX  via recvmmsg  (--batch=N  , default 16)
- *               · batched TX  via sendmmsg  (same N, single connected peer)
+ *               · batched RX via recvmmsg  (--batch=N  , default 16)
+ *               · batched TX via sendmmsg  (same N, fire-and-forget)
  *               · optional CPU pin (--cpu=N)
  *               · per-port signed dloss = agg_fwd − port_recv
  *               · soft-realtime SCHED_FIFO 50
+ *               · reduced clock_gettime() calls (≈ every TIME_CHECK_PKTS pkts)
  *
  * Build:
  *   gcc -O3 -march=native -Wall -std=gnu11 -o rtp_merge rtp_merge.c
  *
  * Example:
  *   sudo setcap cap_sys_nice=eip ./rtp_merge 127.0.0.1 5600 \
- *        --cpu=3 --batch=32 5702 5599
+ *        --cpu=3 --batch=32 --timepkts=2000 5702 5599
  */
 
 #define _GNU_SOURCE
@@ -43,11 +44,12 @@
 #endif
 
 /* ----------------------------------------------------------------- tunables */
-#define MAX_SOCKS  16
-#define MAX_PKT    1500
-#define WIN_BITS   4096
-#define WIN_MASK   (WIN_BITS - 1)
-#define MAX_BATCH  64
+#define MAX_SOCKS   16
+#define MAX_PKT     1500
+#define WIN_BITS    4096
+#define WIN_MASK    (WIN_BITS - 1)
+#define MAX_BATCH   64
+#define DEF_TIME_PK 1024          /* call clock_gettime() after this many pkts */
 
 /* ----------------------------------------------------------------- helpers */
 static void try_rt(int prio)
@@ -138,23 +140,26 @@ int main(int argc, char *argv[])
 {
     if (argc < 4) {
         fprintf(stderr,
-        "Usage: %s OUT_IP OUT_PORT [--batch=N|-bN] [--cpu=N|-cN] IN_PORT...\n",
+        "Usage: %s OUT_IP OUT_PORT [--batch=N|-bN] [--cpu=N|-cN] "
+                "[--timepkts=N] IN_PORT...\n",
         argv[0]); return EXIT_FAILURE; }
 
     const char *out_ip   = argv[1];
     int         out_port = atoi(argv[2]);
 
-    int batch = 16, cpu_pin = -1;
+    int batch = 16, cpu_pin = -1, time_pkts = DEF_TIME_PK;
     int argi  = 3;
     while (argi < argc && argv[argi][0] == '-') {
-        if      (!strncmp(argv[argi], "--batch=", 8)) batch   = atoi(argv[argi]+8);
-        else if (!strncmp(argv[argi], "-b", 2))       batch   = atoi(argv[argi]+2);
-        else if (!strncmp(argv[argi], "--cpu=", 6))   cpu_pin = atoi(argv[argi]+6);
-        else if (!strncmp(argv[argi], "-c", 2))       cpu_pin = atoi(argv[argi]+2);
+        if      (!strncmp(argv[argi], "--batch=",    8)) batch     = atoi(argv[argi]+8);
+        else if (!strncmp(argv[argi], "-b",          2)) batch     = atoi(argv[argi]+2);
+        else if (!strncmp(argv[argi], "--cpu=",      6)) cpu_pin   = atoi(argv[argi]+6);
+        else if (!strncmp(argv[argi], "-c",          2)) cpu_pin   = atoi(argv[argi]+2);
+        else if (!strncmp(argv[argi], "--timepkts=",11)) time_pkts = atoi(argv[argi]+11);
         else { fprintf(stderr, "Unknown option %s\n", argv[argi]); return EXIT_FAILURE; }
         argi++;
     }
-    batch = (batch < 1) ? 1 : (batch > MAX_BATCH ? MAX_BATCH : batch);
+    batch     = (batch     < 1) ? 1 : (batch     > MAX_BATCH ? MAX_BATCH : batch);
+    time_pkts = (time_pkts < 1) ? 1 : time_pkts;
 
     int n_in = argc - argi;
     if (n_in < 1 || n_in > MAX_SOCKS) {
@@ -172,7 +177,7 @@ int main(int argc, char *argv[])
         in[i].sock = make_sock(in[i].port);
     }
 
-    /* output socket (connected) */
+    /* output socket (unconnected, fire-and-forget) */
     int out_sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (out_sock < 0) { perror("socket"); return EXIT_FAILURE; }
     int sz = 256 * 1024;
@@ -184,9 +189,7 @@ int main(int argc, char *argv[])
     if (inet_pton(AF_INET, out_ip, &out_addr.sin_addr) != 1) {
         fprintf(stderr, "Invalid IP %s\n", out_ip); return EXIT_FAILURE;
     }
-    if (connect(out_sock, (struct sockaddr *)&out_addr, sizeof(out_addr)) < 0) {
-        perror("connect"); return EXIT_FAILURE;
-    }
+    /* no connect(): keeps ECONNREFUSED ICMPs from poisoning the socket */
 
     /* shared RX buffers */
     static uint8_t  buf[MAX_BATCH][MAX_PKT];
@@ -206,8 +209,8 @@ int main(int argc, char *argv[])
     static struct   iovec  tx_iov[MAX_BATCH];
     static struct   mmsghdr tx_msg[MAX_BATCH];
     for (int i = 0; i < MAX_BATCH; i++) {
-        tx_msg[i].msg_hdr.msg_name    = NULL;   /* connected socket */
-        tx_msg[i].msg_hdr.msg_namelen = 0;
+        tx_msg[i].msg_hdr.msg_name    = &out_addr;          /* destination */
+        tx_msg[i].msg_hdr.msg_namelen = sizeof(out_addr);
     }
 
     /* running state */
@@ -217,6 +220,8 @@ int main(int argc, char *argv[])
     bool     last_valid= false;
 
     uint64_t agg_recv=0, agg_fwd=0, agg_dup=0, agg_gap=0, agg_late=0;
+    uint64_t pkts_since_time = 0;
+
     struct timespec t_last; clock_gettime(CLOCK_MONOTONIC, &t_last);
 
     /* ----------------------------------------------------------------- main loop */
@@ -228,7 +233,8 @@ int main(int argc, char *argv[])
             if (in[i].sock > maxfd) maxfd = in[i].sock;
         }
         struct timeval tv = {1,0};
-        if (select(maxfd+1, &rfds, NULL, NULL, &tv) < 0) {
+        int sel = select(maxfd+1, &rfds, NULL, NULL, &tv);
+        if (sel < 0) {
             if (errno == EINTR) continue;
             perror("select"); return EXIT_FAILURE;
         }
@@ -255,7 +261,7 @@ int main(int argc, char *argv[])
                     uint32_t ssrc = (p[8] << 24) | (p[9] << 16) |
                                     (p[10] << 8) | p[11];
 
-                    in[i].recv++;  agg_recv++;
+                    in[i].recv++;  agg_recv++;  pkts_since_time++;
 
                     if (ssrc != last_ssrc) {            /* stream reset */
                         last_ssrc = ssrc;
@@ -298,7 +304,14 @@ int main(int argc, char *argv[])
             }
         }
 
-        /* once per second print stats */
+        /* decide whether to touch the clock */
+        bool check_time = false;
+        if (pkts_since_time >= (uint64_t)time_pkts)   check_time = true;
+        if (sel == 0)                                 check_time = true; /* idle */
+
+        if (!check_time) continue;
+        pkts_since_time = 0;
+
         struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
         double elapsed = (now.tv_sec - t_last.tv_sec) +
                          (now.tv_nsec - t_last.tv_nsec) / 1e9;
