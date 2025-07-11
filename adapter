@@ -1,20 +1,44 @@
-set_config() {
-cat << EOF > /tmp/wpa_supplicant.conf
-network={
-        mode=2
-        frequency=$(fw_printenv -n wlanfreq || echo 2412)
-        ssid="$(fw_printenv -n wlanssid || echo OpenIPC)"
-        key_mgmt=NONE
-}
-EOF
+#!/bin/sh
 
+case "$1" in
+        setup)
+                for card in $(lsusb | awk '{print $6}' | uniq); do
+                        case "$card" in
+                                "0bda:8812" | "0bda:881a" | "0b05:17d2" | "2357:0101" | "2604:0012")
+                                        driver=88XXau
+                                        ;;
 
-iw wlan0 set txpower auto
-# Setting AP settings for reduced delay
-iw phy  phy0  set distance 0
-iw phy  phy0  set coverage 0
-iw phy  phy0  set retry  short 4  long 4
-iw phy  phy0  set rts off
+                                "0bda:a81a")
+                                        driver=8812eu
+                                        ;;
 
+                                "0bda:f72b" | "0bda:b733")
+                                        driver=8733bu
+                                        ;;
+                        esac
+                done
 
-}
+                if [ -z "$driver" ]; then
+                        echo "Wireless module not detected!"
+                        exit 1
+                fi
+
+                echo "Detected driver: $driver"
+                modprobe "$driver" rtw_tx_pwr_by_rate=0 rtw_tx_pwr_lmt_enable=0
+                ;;
+
+        start)
+                iw wlan0 set txpower fixed $(fw_printenv -n wlanpwr || echo 1500)
+                hostapd /etc/hostapd.conf -B
+                udhcpd -S
+                ;;
+
+        stop)
+                killall -q udhcpd hostapd
+                ;;
+
+        *)
+                echo "Usage: $0 {setup|start|stop}"
+                exit 1
+                ;;
+esac
