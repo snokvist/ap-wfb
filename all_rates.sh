@@ -30,10 +30,6 @@ compat_mask() {  # $1=name  -> echoes hex OR empty
       ;;
     8812eu)
       case "$1" in
-        mcs0) echo 0x68C ;;
-        mcs1) echo 0x68D ;;
-        mcs2) echo 0x68E ;;
-        mcs3) echo 0x68F ;;
         mcs0-3) echo 0x0000000F ;;
         mcs0-3-sgi) echo 0x0000008F ;;
         mcs7) echo 0x693 ;;
