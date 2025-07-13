@@ -5,106 +5,117 @@
   <title>OPENIPC AP-FPV</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
-    body {
-      font-family: sans-serif;
-      background: #eef4fb;
-      margin: 0; padding: 1.5em;
-      color: #003366;
-      text-align: center;
-    }
-    h1 {
-      color: #0059b3;
-      font-size: 1.6em;
-      margin-bottom: 1em;
-    }
-    .btn {
-      display: block;
-      width: 80%;
-      max-width: 300px;
-      margin: 0.4em auto;
-      padding: 0.8em;
-      font-size: 1em;
-      color: white;
-      background: #007bff;
-      border: none;
-      border-radius: 6px;
-      cursor: pointer;
-    }
-    .btn:hover {
-      background: #0056b3;
-    }
-    select, input {
-      width: 80%;
-      max-width: 300px;
-      padding: 0.6em;
-      margin: 0.4em auto;
-      font-size: 1em;
-      border: 1px solid #ccc;
-      border-radius: 6px;
-      display: block;
-    }
-    pre#info {
-      margin-top: 2em;
-      padding: 1em;
-      background: #dceaff;
-      border: 1px solid #339;
-      border-radius: 6px;
-      white-space: pre-wrap;
-      text-align: left;
-      max-width: 90%;
-      margin-left: auto;
-      margin-right: auto;
-      min-height: 8em;
-      font-size: 0.9em;
-    }
+    /* ------- palette & base -------------------------------------------- */
+    :root { --blue:#007bff; --blue-dk:#0056b3; --bg:#eef4fb; --txt:#003366; }
+    body  { margin:0; font-family:sans-serif; background:var(--bg);
+            color:var(--txt); padding:1.5em; }
+    h1    { text-align:center; color:#0059b3; font-size:1.6em; margin-bottom:1.2em; }
+
+    /* ------- row layout ------------------------------------------------- */
+    .row  { display:flex; justify-content:center; align-items:center;
+            margin:.4em auto; max-width:340px; width:90%; gap:.5em; }
+    .btn  { flex:0 0 120px;            /* ← fixed width for all buttons  */
+            width:120px; padding:.7em 0; font-size:1em; color:#fff;
+            background:var(--blue); border:0; border-radius:6px; cursor:pointer;
+            white-space:nowrap; }
+    .btn:hover { background:var(--blue-dk); }
+    select,input { flex:1; padding:.6em; font-size:1em; border:1px solid #ccc;
+                   border-radius:6px; min-width:0; }  /* min-width:0 lets flex shrink */
+
+    .danger      { background:#dc3545; }
+    .danger:hover{ background:#b02a37; }
+
+    /* info panel */
+    pre#info { margin-top:2em; max-width:90%; margin-left:auto;margin-right:auto;
+               background:#dceaff; border:1px solid #339; border-radius:6px;
+               padding:1em; min-height:8em; white-space:pre-wrap; font-size:.9em; }
   </style>
 </head>
 <body>
 
-  <h1>OPENIPC AP-FPV</h1>
+<h1>OPENIPC AP-FPV</h1>
 
-  <!-- Buttons -->
-  <button class="btn" onclick="go('led_on')">LED On</button>
-  <button class="btn" onclick="go('led_off')">LED Off</button>
+<!-- SSID ------------------------------------------------------------ -->
+<div class="row">
+  <button class="btn" onclick="goArg('set_ssid', ssid.value)">Save&nbsp;SSID</button>
+  <input id="ssid" placeholder="New SSID">
+</div>
 
-  <!-- Dropdown for channel selection -->
+<!-- Password -------------------------------------------------------- -->
+<div class="row">
+  <button class="btn" onclick="goArg('set_password', pass.value)">Save&nbsp;PW</button>
+  <input id="pass" placeholder="New Wi-Fi password">
+</div>
+
+<!-- Channel --------------------------------------------------------- -->
+<div class="row">
+  <button class="btn" onclick="goArg('set_channel', chSel.value)">Set&nbsp;Chan</button>
   <select id="chSel">
     <option value="ch36">ch36</option>
+    <option value="ch36-20">ch36-20</option>
+    <option value="ch44">ch44</option>
+    <option value="ch44-20">ch44-20</option>
+    <option value="ch52">ch52</option>
+    <option value="ch52-20">ch52-20</option>
     <option value="ch100">ch100</option>
-    <option value="ch161">ch161</option>
+    <option value="ch100-20">ch100-20</option>
+    <option value="ch149">ch149</option>
+    <option value="ch149-20">ch149-20</option>
+    <option value="ch157">ch157</option>
+    <option value="ch157-20">ch157-20</option>
   </select>
-  <button class="btn" onclick="goArg('set_chan', chSel.value)">Set Channel</button>
+</div>
 
-  <!-- Textbox for password -->
-  <input id="pass" placeholder="New Wi-Fi password">
-  <button class="btn" onclick="goArg('fw_set', pass.value)">Save Password</button>
+<!-- WLAN power ------------------------------------------------------ -->
+<div class="row">
+  <button class="btn" onclick="goArg('set_wlanpower', pwrSel.value)">Tx&nbsp;Power</button>
+  <select id="pwrSel">
+    <option value="1000">1000</option>
+    <option value="1500">1500</option>
+    <option value="2500">2500</option>
+  </select>
+</div>
 
-  <!-- Info panel -->
-  <pre id="info">(loading...)</pre>
+<!-- Mode ------------------------------------------------------------ -->
+<div class="row">
+  <button class="btn" onclick="goArg('set_mode', modeSel.value)">Set&nbsp;Mode</button>
+  <select id="modeSel">
+    <option value="aalink">aalink</option>
+    <option value="manual">manual</option>
+  </select>
+</div>
+
+<!-- Reboot ---------------------------------------------------------- -->
+<div class="row">
+  <button class="btn danger" style="width:100%;flex:1"
+          onclick="go('reboot')">Reboot&nbsp;Device</button>
+</div>
+
+<!-- Info panel ------------------------------------------------------ -->
+<pre id="info">(loading system info…)</pre>
 
 <script>
-function render(txt){
-  document.getElementById('info').textContent = txt;
-}
+function render(txt){ document.getElementById('info').textContent = txt; }
 
 function go(name){
-  fetch('/cmd/' + name)
-    .then(r => r.text()).then(render)
-    .catch(e => render('Fetch error: ' + e));
+  fetch('/cmd/'+name)
+    .then(r=>r.text()).then(render)
+    .catch(e=>render('Fetch error: '+e));
 }
 
-function goArg(name, arg){
-  const q = '?args=' + encodeURIComponent(arg);
-  fetch('/cmd/' + name + q)
-    .then(r => r.text()).then(render)
-    .catch(e => render('Fetch error: ' + e));
+function goArg(name,arg){
+  const q='?args='+encodeURIComponent(arg);
+  fetch('/cmd/'+name+q)
+    .then(r=>r.text()).then(render)
+    .catch(e=>render('Fetch error: '+e));
 }
 
-// Load system info on page load
-window.onload = function(){
-  fetch('/cmd/sysinfo?args=' + encodeURIComponent('-c -f -v -l -i -S -v -F'))
-    .then(r => r.text()).then(render)
-    .catch(e => render('Error loading info: ' + e));
+/* initial sysinfo */
+window.onload = () => {
+  const args='-c -f -v -l -i -S -v -F';
+  fetch('/cmd/sysinfo?args='+encodeURIComponent(args))
+    .then(r=>r.text()).then(render)
+    .catch(e=>render('Error loading info: '+e));
 };
 </script>
 </body>
