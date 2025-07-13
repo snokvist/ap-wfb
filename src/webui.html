@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Device Control</title>
+</head>
+<body>
+  <h2>Device Control</h2>
+
+  <button onclick="execCmd('led_on',  'LED turned ON')">LED On</button>
+  <button onclick="execCmd('led_off', 'LED turned OFF')">LED Off</button>
+  <button onclick="execCmd('reboot',  'Rebooting device')">Reboot</button>
+
+  <script>
+  function execCmd(name, friendly){
+    if(!confirm(friendly + " – continue?")) return;
+    fetch('/cmd/' + name)
+      .then(r => r.text())
+      .then(t => alert(t.trim()))
+      .catch(e => alert("Error: " + e));
+  }
+  </script>
+</body>
+</html>
