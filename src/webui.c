@@ -1,14 +1,16 @@
 /*
- * tiny_srv.c — micro HTTP/1.0 server for embedded devices
- *   • serves a static HTML dashboard
- *   • dispatches /cmd/<endpoint>?args=... to shell commands
- *   • replies only "Executing command <command>." after completion
+ * tiny_srv.c — micro HTTP/1.0 server with log tail endpoint
  *
  * Build:
  *   arm-linux-gnueabihf-gcc -Os -static tiny_srv.c -o tiny_srv
  *
- * Run:
+ * Typical run:
  *   ./tiny_srv --html index.html --commands commands.conf --port 81
+ *
+ * Endpoints
+ *   GET /                     → index.html
+ *   GET /cmd/<name>[?args=...]→ executes mapped command, returns "OK"
+ *   GET /log                  → last 10 lines of /tmp/webui.log
  */
 
 #define _GNU_SOURCE
@@ -25,14 +27,18 @@
 #include <string.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
-#define PORT_DEF    80
-#define BACKLOG     8
-#define BUF_SZ      1024
-#define MAX_CMDS    64
-#define CMD_MAXLEN  256
+#define PORT_DEF      80
+#define BACKLOG       8
+#define BUF_SZ        1024
+#define MAX_CMDS      64
+#define CMD_MAXLEN    256
+#define LOG_FILE     "/tmp/webui.log"
+#define LOG_TAIL_BUF 8192          /* bytes read from end of log */
+#define LOG_LINES     10           /* how many rows to return    */
 
 struct cmd { char *name; char *base; } cmds[MAX_CMDS];
 size_t n_cmds = 0;
@@ -47,7 +53,7 @@ static void die(const char *fmt, ...)
     exit(EXIT_FAILURE);
 }
 
-static char *slurp(const char *path, size_t *out_len)
+static char *slurp(const char *path, size_t *len_out)
 {
     FILE *f = fopen(path, "rb");
     if (!f) die("Cannot open %s: %s\n", path, strerror(errno));
@@ -60,7 +66,7 @@ static char *slurp(const char *path, size_t *out_len)
     fread(buf, 1, sz, f);
     buf[sz] = 0;
     fclose(f);
-    if (out_len) *out_len = sz;
+    if (len_out) *len_out = sz;
     return buf;
 }
 
@@ -72,14 +78,14 @@ static char *rtrim(char *s)
 }
 
 /* -------------------------------------------------------------------------- */
-/* commands.conf loader */
+/* load commands.conf */
 static void load_commands(const char *path)
 {
     char *file = slurp(path, NULL);
     char *saveptr = NULL, *line = strtok_r(file, "\r\n", &saveptr);
 
     while (line && n_cmds < MAX_CMDS) {
-        while (*line == ' ' || *line == '\t') ++line;      /* trim lead ws */
+        while (*line == ' ' || *line == '\t') ++line;
         if (*line && *line != '#') {
             char *colon = strchr(line, ':');
             if (!colon) die("Bad line in %s: %s\n", path, line);
@@ -96,7 +102,7 @@ static void load_commands(const char *path)
 }
 
 /* -------------------------------------------------------------------------- */
-/* tiny URL‑decoder (in‑place) */
+/* URL‑decode (in place) */
 static void url_decode(char *s)
 {
     char *o = s, *p = s;
@@ -105,7 +111,7 @@ static void url_decode(char *s)
             char hex[3] = {p[1], p[2], 0};
             *o++ = (char)strtol(hex, NULL, 16);
             p += 3;
-        } else if (*p == '+') { *o++ = ' '; p++; }
+        } else if (*p == '+') { *o++ = ' '; ++p; }
         else { *o++ = *p++; }
     }
     *o = 0;
@@ -129,6 +135,40 @@ static int set_nonblock(int fd)
 }
 
 /* -------------------------------------------------------------------------- */
+/* send last LOG_LINES lines of LOG_FILE */
+static void send_log(int cfd)
+{
+    int fd = open(LOG_FILE, O_RDONLY);
+    if (fd < 0) {
+        dprintf(cfd,
+                "HTTP/1.0 200 OK\r\nContent-Type:text/plain\r\n\r\n(no log)\n");
+        return;
+    }
+
+    off_t sz = lseek(fd, 0, SEEK_END);
+    off_t start = 0;
+    if (sz > LOG_TAIL_BUF) start = sz - LOG_TAIL_BUF;
+    lseek(fd, start, SEEK_SET);
+
+    char buf[LOG_TAIL_BUF + 1];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n < 0) n = 0;
+    buf[n] = 0;
+
+    /* find last LOG_LINES newlines */
+    int lines = 0;
+    char *p = buf + n;
+    while (p > buf) {
+        if (*--p == '\n' && ++lines == LOG_LINES) { ++p; break; }
+    }
+    if (p < buf) p = buf;   /* file has < LOG_LINES lines */
+
+    dprintf(cfd,
+            "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\n%s", p);
+}
+
+/* -------------------------------------------------------------------------- */
 static void handle_request(int cfd)
 {
     char buf[BUF_SZ + 1];
@@ -142,12 +182,18 @@ static void handle_request(int cfd)
     ++path_start;
     char *path_end = strchr(path_start, ' ');
     if (!path_end) return;
-    *path_end = 0;                       /* /path?... now terminated */
+    *path_end = 0;
 
     /* root */
     if (!strcmp(path_start, "/")) {
         send(cfd, HTML_HDR, strlen(HTML_HDR), 0);
         send(cfd, html_buf, html_len, 0);
+        return;
+    }
+
+    /* /log */
+    if (!strcmp(path_start, "/log")) {
+        send_log(cfd);
         return;
     }
 
@@ -157,11 +203,10 @@ static void handle_request(int cfd)
         char *qs   = strchr(name, '?');
         if (qs) *qs = 0;
 
-        /* find base command */
+        /* find base */
         const char *base = NULL;
         for (size_t k = 0; k < n_cmds; ++k)
             if (!strcmp(cmds[k].name, name)) { base = cmds[k].base; break; }
-
         if (!base) {
             dprintf(cfd,
                     "HTTP/1.0 404 Not Found\r\n\r\nUnknown command %s\n",
@@ -174,7 +219,7 @@ static void handle_request(int cfd)
         strncpy(final, base, CMD_MAXLEN - 1);
         final[CMD_MAXLEN - 1] = 0;
 
-        if (qs) {                                 /* ?args=... present */
+        if (qs) {
             char *arg = strstr(qs + 1, "args=");
             if (arg) {
                 arg += 5;
@@ -189,14 +234,11 @@ static void handle_request(int cfd)
             }
         }
 
-        /* run and wait */
-        int rc = system(final);
-        (void)rc;  /* exit code ignored, but we’ve waited for completion */
+        /* execute and wait */
+        system(final);
 
         dprintf(cfd,
-                "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\n"
-                "Executing command %s.\n",
-                final);
+                "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\nOK\n");
         return;
     }
 
@@ -212,7 +254,6 @@ int main(int argc, char **argv)
     const char *html_path = NULL, *cmd_path = NULL;
     int port = PORT_DEF;
 
-    /* parse CLI options */
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--html") && i + 1 < argc) html_path = argv[++i];
         else if (!strcmp(argv[i], "--commands") && i + 1 < argc)
@@ -242,10 +283,10 @@ int main(int argc, char **argv)
         die("bind/listen: %s\n", strerror(errno));
 
     set_nonblock(sfd);
-    printf("tiny_srv: port %d  (html %s, commands %s)\n",
-           port, html_path, cmd_path);
+    printf("tiny_srv: port %d  (html %s, commands %s, log %s)\n",
+           port, html_path, cmd_path, LOG_FILE);
 
-    /* main select loop */
+    /* main loop */
     for (;;) {
         fd_set rfds; FD_ZERO(&rfds); FD_SET(sfd, &rfds); int maxfd = sfd;
 
