@@ -38,7 +38,7 @@
 #define CMD_MAXLEN    256
 #define LOG_FILE     "/tmp/webui.log"
 #define LOG_TAIL_BUF 8192          /* bytes read from end of log */
-#define LOG_LINES     10           /* how many rows to return    */
+#define LOG_LINES     60           /* how many rows to return    */
 
 struct cmd { char *name; char *base; } cmds[MAX_CMDS];
 size_t n_cmds = 0;
