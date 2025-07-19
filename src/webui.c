@@ -88,7 +88,8 @@ static char *rtrim(char *s)
 }
 
 /* -------------------------------------------------------------------------- */
-/* load commands.conf (both /cmd and /value lines) */
+/* -------------------------------------------------------------------------- */
+/* load commands.conf (cmd:name:...  OR  value:name:cmd  OR  value:name cmd ) */
 static void load_commands(const char *path)
 {
     char *file = slurp(path, NULL);
@@ -97,22 +98,50 @@ static void load_commands(const char *path)
     while (line) {
         while (*line == ' ' || *line == '\t') ++line;
         if (*line && *line != '#') {
-            char *colon = strchr(line, ':');
-            if (!colon) die("Bad line in %s: %s\n", path, line);
 
-            *colon = 0;
-            char *name = rtrim(line);
-            char *cmd  = colon + 1;
-            while (*cmd == ' ' || *cmd == '\t') ++cmd;
-            rtrim(cmd);
+            char *c1 = strchr(line, ':');                 /* first colon        */
+            if (!c1) die("Bad line in %s: %s\n", path, line);
 
-            if (!strncmp(name, "value:", 6)) {
-                name += 6;
+            *c1 = 0;
+            char *left  = rtrim(line);                    /* "value" or name    */
+            char *right = c1 + 1;                        /* remainder          */
+
+            /* ---------------- VALUE entry -------------------------------- */
+            if (!strncmp(left, "value", 5)) {
+                char *vname, *vcmd;
+
+                /* skip optional second leading colon  (value::name…) */
+                if (*right == ':') ++right;
+
+                /* try to split name/cmd at next colon */
+                char *c2 = strchr(right, ':');
+                if (c2) {                                /* value:name:cmd     */
+                    *c2 = 0;
+                    vname = rtrim(right);
+                    vcmd  = c2 + 1;
+                } else {                                 /* value:name <cmd>   */
+                    vname = right;
+                    /* find first whitespace that separates the command */
+                    vcmd = strpbrk(right, " \t");
+                    if (!vcmd)
+                        die("Bad value line in %s: %s\n", path, left);
+                    *vcmd++ = 0;
+                }
+
+                while (*vcmd == ' ' || *vcmd == '\t') ++vcmd;
+                rtrim(vcmd);
+
                 if (n_vals >= MAX_VALS) die("Too many values\n");
-                vals[n_vals++] = (struct cmd){strdup(name), strdup(cmd)};
-            } else {
+                vals[n_vals++] = (struct cmd){strdup(vname), strdup(vcmd)};
+            }
+            /* ---------------- COMMAND entry ------------------------------ */
+            else {
+                char *cmd = right;
+                while (*cmd == ' ' || *cmd == '\t') ++cmd;
+                rtrim(cmd);
+
                 if (n_cmds >= MAX_CMDS) die("Too many commands\n");
-                cmds[n_cmds++] = (struct cmd){strdup(name), strdup(cmd)};
+                cmds[n_cmds++] = (struct cmd){strdup(left), strdup(cmd)};
             }
         }
         line = strtok_r(NULL, "\r\n", &saveptr);
@@ -120,6 +149,7 @@ static void load_commands(const char *path)
 
     if (!n_cmds && !n_vals) die("No entries loaded from %s\n", path);
 }
+
 
 /* -------------------------------------------------------------------------- */
 /* URL‑decode (in place) */
