@@ -1,16 +1,17 @@
 /*
- * tiny_srv.c — micro HTTP/1.0 server with log tail endpoint
+ * tiny_srv.c — micro HTTP/1.0 server with command + value endpoints
  *
  * Build:
- *   arm-linux-gnueabihf-gcc -Os -static tiny_srv.c -o tiny_srv
+ *   arm-linux-gnueabihf-gcc -Os -static tiny_srv.c -o web
  *
  * Typical run:
- *   ./tiny_srv --html index.html --commands commands.conf --port 81
+ *   ./web --html index.html --commands commands.conf --port 81
  *
  * Endpoints
- *   GET /                     → index.html
- *   GET /cmd/<name>[?args=...]→ executes mapped command, returns "OK"
- *   GET /log                  → last 10 lines of /tmp/webui.log
+ *   GET /                         → index.html
+ *   GET /cmd/<name>[?args=...]    → executes mapped command, returns "OK"
+ *   GET /value/<name>             → executes mapped read‑only command, returns its stdout
+ *   GET /log                      → last 60 lines of /tmp/webui.log
  */
 
 #define _GNU_SOURCE
@@ -25,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -35,16 +37,24 @@
 #define BACKLOG       8
 #define BUF_SZ        1024
 #define MAX_CMDS      64
+#define MAX_VALS      32
 #define CMD_MAXLEN    256
 #define LOG_FILE     "/tmp/webui.log"
 #define LOG_TAIL_BUF 8192          /* bytes read from end of log */
 #define LOG_LINES     60           /* how many rows to return    */
 
-struct cmd { char *name; char *base; } cmds[MAX_CMDS];
-size_t n_cmds = 0;
+struct cmd { char *name; char *base; };
+
+struct cmd cmds[MAX_CMDS];   size_t n_cmds = 0;
+struct cmd vals[MAX_VALS];   size_t n_vals = 0;
 
 char *html_buf = NULL;  size_t html_len = 0;
 const char *HTML_HDR = "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\n\r\n";
+
+/* -------------------------------------------------------------------------- */
+/* graceful shutdown flag & handler */
+volatile sig_atomic_t quit_flag = 0;
+static void sig_handler(int sig) { (void)sig; quit_flag = 1; }
 
 /* -------------------------------------------------------------------------- */
 static void die(const char *fmt, ...)
@@ -78,27 +88,37 @@ static char *rtrim(char *s)
 }
 
 /* -------------------------------------------------------------------------- */
-/* load commands.conf */
+/* load commands.conf (both /cmd and /value lines) */
 static void load_commands(const char *path)
 {
     char *file = slurp(path, NULL);
     char *saveptr = NULL, *line = strtok_r(file, "\r\n", &saveptr);
 
-    while (line && n_cmds < MAX_CMDS) {
+    while (line) {
         while (*line == ' ' || *line == '\t') ++line;
         if (*line && *line != '#') {
             char *colon = strchr(line, ':');
             if (!colon) die("Bad line in %s: %s\n", path, line);
+
             *colon = 0;
             char *name = rtrim(line);
             char *cmd  = colon + 1;
             while (*cmd == ' ' || *cmd == '\t') ++cmd;
             rtrim(cmd);
-            cmds[n_cmds++] = (struct cmd){strdup(name), strdup(cmd)};
+
+            if (!strncmp(name, "value:", 6)) {
+                name += 6;
+                if (n_vals >= MAX_VALS) die("Too many values\n");
+                vals[n_vals++] = (struct cmd){strdup(name), strdup(cmd)};
+            } else {
+                if (n_cmds >= MAX_CMDS) die("Too many commands\n");
+                cmds[n_cmds++] = (struct cmd){strdup(name), strdup(cmd)};
+            }
         }
         line = strtok_r(NULL, "\r\n", &saveptr);
     }
-    if (!n_cmds) die("No commands loaded from %s\n", path);
+
+    if (!n_cmds && !n_vals) die("No entries loaded from %s\n", path);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -162,7 +182,7 @@ static void send_log(int cfd)
     while (p > buf) {
         if (*--p == '\n' && ++lines == LOG_LINES) { ++p; break; }
     }
-    if (p < buf) p = buf;   /* file has < LOG_LINES lines */
+    if (p < buf) p = buf;
 
     dprintf(cfd,
             "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\n%s", p);
@@ -194,6 +214,41 @@ static void handle_request(int cfd)
     /* /log */
     if (!strcmp(path_start, "/log")) {
         send_log(cfd);
+        return;
+    }
+
+    /* /value/<name> */
+    if (!strncmp(path_start, "/value/", 7)) {
+        char *name = path_start + 7;
+
+        const char *cmd = NULL;
+        for (size_t k = 0; k < n_vals; ++k)
+            if (!strcmp(vals[k].name, name)) { cmd = vals[k].base; break; }
+
+        if (!cmd) {
+            dprintf(cfd,
+                    "HTTP/1.0 404 Not Found\r\n\r\nUnknown value %s\n", name);
+            return;
+        }
+
+        FILE *p = popen(cmd, "r");
+        if (!p) {
+            dprintf(cfd,
+                    "HTTP/1.0 500 Internal\r\n\r\nExec failed\n");
+            return;
+        }
+
+        char out[128] = {0};
+        fgets(out, sizeof(out) - 1, p);
+        pclose(p);
+        /* strip trailing CR/LF */
+        size_t L = strlen(out);
+        while (L && (out[L - 1] == '\n' || out[L - 1] == '\r'))
+            out[--L] = 0;
+
+        dprintf(cfd,
+                "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\n%s\n",
+                out);
         return;
     }
 
@@ -234,7 +289,6 @@ static void handle_request(int cfd)
             }
         }
 
-        /* execute and wait */
         system(final);
 
         dprintf(cfd,
@@ -249,7 +303,13 @@ static void handle_request(int cfd)
 /* -------------------------------------------------------------------------- */
 int main(int argc, char **argv)
 {
+    /* make "web" visible in ps/top/killall */
+    prctl(PR_SET_NAME, "web", 0, 0, 0);
+
+    /* graceful signals */
     signal(SIGPIPE, SIG_IGN);
+    signal(SIGTERM, sig_handler);
+    signal(SIGINT , sig_handler);
 
     const char *html_path = NULL, *cmd_path = NULL;
     int port = PORT_DEF;
@@ -287,7 +347,7 @@ int main(int argc, char **argv)
            port, html_path, cmd_path, LOG_FILE);
 
     /* main loop */
-    for (;;) {
+    while (!quit_flag) {
         fd_set rfds; FD_ZERO(&rfds); FD_SET(sfd, &rfds); int maxfd = sfd;
 
         struct sockaddr_in cli; socklen_t clilen = sizeof(cli);
@@ -295,7 +355,12 @@ int main(int argc, char **argv)
         while ((cfd = accept(sfd, (struct sockaddr *)&cli, &clilen)) >= 0) {
             set_nonblock(cfd); FD_SET(cfd, &rfds); if (cfd > maxfd) maxfd = cfd;
         }
-        select(maxfd + 1, &rfds, NULL, NULL, NULL);
+
+        int rc = select(maxfd + 1, &rfds, NULL, NULL, NULL);
+        if (rc < 0) {
+            if (errno == EINTR) continue; /* interrupted by signal */
+            die("select: %s\n", strerror(errno));
+        }
 
         for (int fd = 0; fd <= maxfd; ++fd)
             if (FD_ISSET(fd, &rfds) && fd != sfd) {
@@ -303,5 +368,7 @@ int main(int argc, char **argv)
                 close(fd);
             }
     }
+
+    close(sfd);
     return 0;
 }
