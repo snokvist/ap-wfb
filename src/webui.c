@@ -1,404 +1,449 @@
-/*
- * tiny_srv.c — micro HTTP/1.0 server with command + value endpoints
- *
- * Build:
- *   arm-linux-gnueabihf-gcc -Os -static tiny_srv.c -o web
- *
- * Typical run:
- *   ./web --html index.html --commands commands.conf --port 81
- *
- * Endpoints
- *   GET /                         → index.html
- *   GET /cmd/<name>[?args=...]    → executes mapped command, returns "OK"
- *   GET /value/<name>             → executes mapped read‑only command, returns its stdout
- *   GET /log                      → last 60 lines of /tmp/webui.log
- */
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>OPENIPC AP-FPV</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    /* ------- palette & base -------------------------------------------- */
+    :root { --blue:#007bff; --blue-dk:#0056b3; --bg:#eef4fb; --txt:#003366;
+            --panel:#ffffff; --panel-brd:#0056b3; --slider-bg:#f5f9ff; }
+    body  { margin:0; font-family:sans-serif; background:var(--bg);
+            color:var(--txt); padding:1.5em; }
+    h1    { text-align:center; color:#0059b3; font-size:1.6em; margin:.1em 0; }
 
-#define _GNU_SOURCE
-#include <arpa/inet.h>
-#include <ctype.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <netinet/in.h>
-#include <signal.h>
-#include <stdarg.h>
-#include <stdbool.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/prctl.h>
-#include <sys/select.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/wait.h>
-#include <unistd.h>
-
-#define PORT_DEF      80
-#define BACKLOG       8
-#define BUF_SZ        1024
-#define MAX_CMDS      64
-#define MAX_VALS      32
-#define CMD_MAXLEN    256
-#define LOG_FILE     "/tmp/webui.log"
-#define LOG_TAIL_BUF 8192          /* bytes read from end of log */
-#define LOG_LINES     60           /* how many rows to return    */
-
-struct cmd { char *name; char *base; };
-
-struct cmd cmds[MAX_CMDS];   size_t n_cmds = 0;
-struct cmd vals[MAX_VALS];   size_t n_vals = 0;
-
-char *html_buf = NULL;  size_t html_len = 0;
-const char *HTML_HDR = "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\n\r\n";
-
-/* -------------------------------------------------------------------------- */
-/* graceful shutdown flag & handler */
-volatile sig_atomic_t quit_flag = 0;
-static void sig_handler(int sig) { (void)sig; quit_flag = 1; }
-
-/* -------------------------------------------------------------------------- */
-static void die(const char *fmt, ...)
-{
-    va_list ap; va_start(ap, fmt); vfprintf(stderr, fmt, ap); va_end(ap);
-    exit(EXIT_FAILURE);
-}
-
-static char *slurp(const char *path, size_t *len_out)
-{
-    FILE *f = fopen(path, "rb");
-    if (!f) die("Cannot open %s: %s\n", path, strerror(errno));
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    if (sz < 0) die("ftell failed on %s\n", path);
-    rewind(f);
-    char *buf = malloc(sz + 1);
-    if (!buf) die("OOM\n");
-    fread(buf, 1, sz, f);
-    buf[sz] = 0;
-    fclose(f);
-    if (len_out) *len_out = sz;
-    return buf;
-}
-
-static char *rtrim(char *s)
-{
-    size_t n = strlen(s);
-    while (n && (s[n - 1] == ' ' || s[n - 1] == '\t')) s[--n] = 0;
-    return s;
-}
-
-/* -------------------------------------------------------------------------- */
-/* -------------------------------------------------------------------------- */
-/* load commands.conf (cmd:name:...  OR  value:name:cmd  OR  value:name cmd ) */
-static void load_commands(const char *path)
-{
-    char *file = slurp(path, NULL);
-    char *saveptr = NULL, *line = strtok_r(file, "\r\n", &saveptr);
-
-    while (line) {
-        while (*line == ' ' || *line == '\t') ++line;
-        if (*line && *line != '#') {
-
-            char *c1 = strchr(line, ':');                 /* first colon        */
-            if (!c1) die("Bad line in %s: %s\n", path, line);
-
-            *c1 = 0;
-            char *left  = rtrim(line);                    /* "value" or name    */
-            char *right = c1 + 1;                        /* remainder          */
-
-            /* ---------------- VALUE entry -------------------------------- */
-            if (!strncmp(left, "value", 5)) {
-                char *vname, *vcmd;
-
-                /* skip optional second leading colon  (value::name…) */
-                if (*right == ':') ++right;
-
-                /* try to split name/cmd at next colon */
-                char *c2 = strchr(right, ':');
-                if (c2) {                                /* value:name:cmd     */
-                    *c2 = 0;
-                    vname = rtrim(right);
-                    vcmd  = c2 + 1;
-                } else {                                 /* value:name <cmd>   */
-                    vname = right;
-                    /* find first whitespace that separates the command */
-                    vcmd = strpbrk(right, " \t");
-                    if (!vcmd)
-                        die("Bad value line in %s: %s\n", path, left);
-                    *vcmd++ = 0;
-                }
-
-                while (*vcmd == ' ' || *vcmd == '\t') ++vcmd;
-                rtrim(vcmd);
-
-                if (n_vals >= MAX_VALS) die("Too many values\n");
-                vals[n_vals++] = (struct cmd){strdup(vname), strdup(vcmd)};
-            }
-            /* ---------------- COMMAND entry ------------------------------ */
-            else {
-                char *cmd = right;
-                while (*cmd == ' ' || *cmd == '\t') ++cmd;
-                rtrim(cmd);
-
-                if (n_cmds >= MAX_CMDS) die("Too many commands\n");
-                cmds[n_cmds++] = (struct cmd){strdup(left), strdup(cmd)};
-            }
-        }
-        line = strtok_r(NULL, "\r\n", &saveptr);
+    /* ------- tab buttons ------------------------------------------------ */
+    .tabs { display:flex; max-width:340px; width:90%; margin:1em auto 0; }
+    .tab-btn {
+      flex:1; padding:.7em 0; font-size:1em; text-align:center;
+      background:var(--bg); color:var(--blue); border:1px solid var(--blue);
+      border-bottom:none; border-radius:6px 6px 0 0; cursor:pointer;
+      user-select:none;
+    }
+    .tab-btn + .tab-btn { margin-left:.2em; }
+    .tab-btn.active {
+      background:#fff; color:var(--txt); border-color:var(--blue-dk);
     }
 
-    if (!n_cmds && !n_vals) die("No entries loaded from %s\n", path);
-}
-
-
-/* -------------------------------------------------------------------------- */
-/* URL‑decode (in place) */
-static void url_decode(char *s)
-{
-    char *o = s, *p = s;
-    while (*p) {
-        if (*p == '%' && isxdigit(p[1]) && isxdigit(p[2])) {
-            char hex[3] = {p[1], p[2], 0};
-            *o++ = (char)strtol(hex, NULL, 16);
-            p += 3;
-        } else if (*p == '+') { *o++ = ' '; ++p; }
-        else { *o++ = *p++; }
+    /* ------- tab content ------------------------------------------------ */
+    .tab-content {
+      max-width:340px; width:90%; margin:0 auto 2em;
+      background:var(--panel); border:1px solid var(--panel-brd);
+      border-radius:0 6px 6px 6px; padding:1em;
     }
-    *o = 0;
-}
+    .tab-content.hidden { display:none; }
 
-/* allow‑list for args */
-static bool safe_arg(const char *s)
-{
-    for (; *s; ++s)
-        if (!(isalnum(*s) || *s == '_' || *s == '-' || *s == '.' ||
-              *s == '/' || *s == ' '))
-            return false;
-    return true;
-}
+    /* ------- row layout ------------------------------------------------- */
+    .row  { display:flex; justify-content:center; align-items:center;
+            margin:.4em 0; gap:.5em; }
+    .btn  { flex:0 0 120px; width:120px; padding:.7em 0; font-size:1em;
+            color:#fff; background:var(--blue); border:0; border-radius:6px;
+            cursor:pointer; white-space:nowrap; }
+    .btn:hover { background:var(--blue-dk); }
 
-/* -------------------------------------------------------------------------- */
-static int set_nonblock(int fd)
-{
-    int fl = fcntl(fd, F_GETFL, 0);
-    return fcntl(fd, F_SETFL, fl | O_NONBLOCK);
-}
+    .btn.info { background:#28a745; }
+    .btn.info:hover { background:#218838; }
 
-/* -------------------------------------------------------------------------- */
-/* send last LOG_LINES lines of LOG_FILE */
-static void send_log(int cfd)
-{
-    int fd = open(LOG_FILE, O_RDONLY);
-    if (fd < 0) {
-        dprintf(cfd,
-                "HTTP/1.0 200 OK\r\nContent-Type:text/plain\r\n\r\n(no log)\n");
-        return;
+    select,input { flex:1; padding:.6em; font-size:1em; border:1px solid #ccc;
+                   border-radius:6px; min-width:0; }
+
+    .danger      { background:#dc3545; }
+    .danger:hover{ background:#b02a37; }
+
+    /* ------- cohesive slider block ------------------------------------- */
+    .slider-container {
+      flex-direction:column; align-items:center;
+      width:100%;
+      box-sizing:border-box;
+      background:var(--slider-bg); border:1px solid var(--blue);
+      border-radius:6px; padding:.7em .8em;
     }
-
-    off_t sz = lseek(fd, 0, SEEK_END);
-    off_t start = 0;
-    if (sz > LOG_TAIL_BUF) start = sz - LOG_TAIL_BUF;
-    lseek(fd, start, SEEK_SET);
-
-    char buf[LOG_TAIL_BUF + 1];
-    ssize_t n = read(fd, buf, sizeof(buf) - 1);
-    close(fd);
-    if (n < 0) n = 0;
-    buf[n] = 0;
-
-    /* find last LOG_LINES newlines */
-    int lines = 0;
-    char *p = buf + n;
-    while (p > buf) {
-        if (*--p == '\n' && ++lines == LOG_LINES) { ++p; break; }
+    .slider-container label {
+      font-size:1em; font-weight:600; width:100%; text-align:center;
+      margin-bottom:.4em;
     }
-    if (p < buf) p = buf;
-
-    dprintf(cfd,
-            "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\n%s", p);
-}
-
-/* -------------------------------------------------------------------------- */
-static void handle_request(int cfd)
-{
-    char buf[BUF_SZ + 1];
-    int n = read(cfd, buf, BUF_SZ);
-    if (n <= 0) return;
-    buf[n] = 0;
-
-    /* isolate path */
-    char *path_start = strchr(buf, ' ');
-    if (!path_start) return;
-    ++path_start;
-    char *path_end = strchr(path_start, ' ');
-    if (!path_end) return;
-    *path_end = 0;
-
-    /* root */
-    if (!strcmp(path_start, "/")) {
-        send(cfd, HTML_HDR, strlen(HTML_HDR), 0);
-        send(cfd, html_buf, html_len, 0);
-        return;
+    input[type=range] {
+      -webkit-appearance:none;
+      width:92%;
+      height:8px; background:#ddd; border-radius:4px; cursor:pointer;
+    }
+    input[type=range]:focus { outline:none; }
+    input[type=range]::-webkit-slider-thumb {
+      -webkit-appearance:none;
+      width:24px; height:24px; margin-top:-8px;
+      background:var(--blue); border-radius:50%; cursor:pointer;
+      touch-action:none;
+    }
+    input[type=range]::-moz-range-thumb {
+      width:24px; height:24px; background:var(--blue);
+      border:none; border-radius:50%; cursor:pointer; touch-action:none;
     }
 
-    /* /log */
-    if (!strcmp(path_start, "/log")) {
-        send_log(cfd);
-        return;
+    /* ------- info box --------------------------------------------------- */
+    .info-box { margin-top:1em; background:#dceaff; border:1px solid #339;
+                border-radius:6px; padding:1em; min-height:6em;
+                white-space:pre-wrap; font-size:.9em; }
+  </style>
+</head>
+<body>
+
+<h1>OPENIPC AP-FPV</h1>
+<center><body>---<::: RC6 aalink4h :::>---</body></center>
+
+<!-- Tabs -->
+<div class="tabs">
+  <div class="tab-btn active" id="tabControl">Control</div>
+  <div class="tab-btn"        id="tabSetup">Setup</div>
+</div>
+
+<!-- Control Tab Content -->
+<div class="tab-content" id="contentControl">
+
+  <!-- Exec VTX cmd -->
+  <div class="row">
+    <button class="btn" onclick="goArg('control_cmd', sendVTXCmd.value)">VTX CMD</button>
+    <select id="sendVTXCmd">
+      <option value="vtx1">VTX cmd1</option>
+      <option value="vtx2">VTX cmd2</option>
+      <option value="vtx2">VTX cmd3</option>
+    </select>
+  </div>
+  
+  <!-- Exec VRX master cmd -->
+  <div class="row">
+    <button class="btn" onclick="goArg('control_cmd', sendVRXCmd.value)">VRX CMD</button>
+    <select id="sendVRXCmd">
+      <option value="vrx_ping">Ping VRX</option>
+      <option value="vrx_toggle_rec">Toggle VRX record</option>
+      <option value="vrx_shutdown">Shutdown VRX</option>
+    </select>
+  </div>
+
+  <!-- aalink control -->
+  <div class="row">
+    <button class="btn" onclick="goArg('control_cmd', sendAalinkCmd.value)">aalink CMD</button>
+    <select id="sendAalinkCmd">
+      <option value="aalink_signalbar_enable">Signalbar enable</option>
+      <option value="aalink_signalbar_disable">Signalbar disable</option>
+      <option value="aalink_osd_level 0">No OSD</option>
+      <option value="aalink_osd_level 1">Compact OSD</option>
+      <option value="aalink_osd_level 2">Full OSD</option>
+      <option value="aalink_font_size 30">Small font</option>
+      <option value="aalink_font_size 38">Medium font</option>
+      <option value="aalink_font_size 44">Large font</option>
+      <option value="aalink_mcs_source lowest">Source Lowest LQ</option>
+      <option value="aalink_mcs_source highest">Source Highest LQ</option>
+      <option value="aalink_mcs_source both">Source Both LQ</option>
+      <option value="aalink_mcs_source uplink">Source Uplink LQ</option>
+      <option value="aalink_mcs_source downlink">Source Downlink LQ</option>
+    </select>
+  </div>
+  
+  <!-- throughput slider ---------------------------------------------------- -->
+  <div class="row slider-container">
+    <label for="throughputSlider">aalink Throughput %: <span id="throughputValue">50</span></label>
+    <input type="range" id="throughputSlider" min="25" max="75" value="50">
+  </div>
+
+  <!-- OSD size slider ------------------------------------------------------- -->
+  <div class="row slider-container">
+    <label for="osdSlider">OSD Font Size: <span id="osdValue">38</span></label>
+    <input type="range" id="osdSlider" min="20" max="60" step="2" value="38">
+  </div>
+
+  <!-- Reboot -->
+  <div class="row">
+    <button class="btn danger" style="width:100%;flex:1"
+            onclick="go('reboot')">Reboot&nbsp;Device</button>
+  </div>
+
+  <!-- Show Info -->
+  <div class="row">
+    <button class="btn info" style="width:100%;flex:1"
+            onclick="go('sysinfo')">Show Info</button>
+  </div>
+
+  <!-- Show aalink settings -->
+  <div class="row">
+    <button class="btn info" style="width:100%;flex:1"
+            onclick="goArg('control_cmd', 'aalink_print_settings')">
+      Show aalink Settings
+    </button>
+  </div>
+  
+  <pre class="info-box" id="infoControl">(no log yet)</pre>
+</div>
+
+<!-- Setup Tab Content -->
+<div class="tab-content hidden" id="contentSetup">
+  <!-- SSID -->
+  <div class="row">
+    <button class="btn" onclick="goArg('set_ssid', ssid.value)">Save&nbsp;SSID</button>
+    <input id="ssid" placeholder="New SSID">
+  </div>
+
+  <!-- Password -->
+  <div class="row">
+    <button class="btn" onclick="goArg('set_password', pass.value)">Save&nbsp;PW</button>
+    <input id="pass" placeholder="New password">
+  </div>
+
+  <!-- Channel -->
+  <div class="row">
+    <button class="btn" onclick="goArg('set_channel', chSel.value)">Set&nbsp;Chan</button>
+    <select id="chSel">
+      <option value="ch157 --make-permanent">ch157</option>
+      <option value="ch149 --make-permanent">ch149</option>
+      <option value="ch52 --make-permanent">ch52</option>
+      <option value="ch44 --make-permanent">ch44</option>
+      <option value="ch36 --make-permanent">ch36</option>
+      <option value="ch157-20 --make-permanent">ch157-20</option>
+      <option value="ch149-20 --make-permanent">ch149-20</option>
+      <option value="ch52-20 --make-permanent">ch52-20</option>
+      <option value="ch44-20 --make-permanent">ch44-20</option>
+      <option value="ch36-20 --make-permanent">ch36-20</option> 
+    </select>
+  </div>
+
+  <!-- WLAN power -->
+  <div class="row">
+    <button class="btn" onclick="goArg('set_wlanpower', pwrSel.value)">Set&nbsp;Power</button>
+    <select id="pwrSel">
+      <option value="pitmode">Pitmode</option>
+      <option value="low">Low</option>
+      <option value="medium">Medium</option>
+      <option value="high">High</option>
+    </select>
+  </div>
+
+  <!-- OSD -->
+  <div class="row">
+    <button class="btn" onclick="goArg('set_osd', ttySel.value)">Set&nbsp;OSD</button>
+    <select id="ttySel">
+      <option value="mode-standalone">No-tty(standalone)</option>
+      <option value="mode-tty0">/dev/ttyS0</option>
+      <option value="mode-tty1">/dev/ttyS1</option>
+      <option value="mode-tty2">/dev/ttyS2</option>
+      <option value="mode-manual">Static bitrate</option>
+      <option value="mode-aalink">Adaptive bitrate</option>
+    </select>
+  </div>
+
+  <!-- Video Resolution -->
+  <div class="row">
+    <button class="btn" onclick="goArg('set_video', videoSel.value)">Set&nbsp;Video</button>
+    <select id="videoSel">
+      <option value="1">4:3 720p 60</option>
+      <option value="2">4:3 720p 60 50HzAC</option>
+      <option value="3">4:3 960p 60</option>
+      <option value="4">4:3 960p 60 50HzAC</option>
+      <option value="5">4:3 1080p 60</option>
+      <option value="6">4:3 1080p 60 50HzAC</option>
+      <option value="7">4:3 1440p 60</option>
+      <option value="8">4:3 1440p 60 50HzAC</option>
+      <option value="9">4:3 1920p 60</option>
+      <option value="10">4:3 1920p 60 50HzAC</option>
+      <option value="11">4:3 720p 90</option>
+      <option value="12">4:3 720p 90 50HzAC</option>
+      <option value="13">4:3 960p 90</option>
+      <option value="14">4:3 960p 90 50HzAC</option>
+      <option value="15">4:3 1080p 90</option>
+      <option value="16">4:3 1080p 90 50HzAC</option>
+      <option value="17">4:3 1440p 90</option>
+      <option value="18">4:3 1440p 90 50HzAC</option>
+      <option value="19">4:3 540p 120</option>
+      <option value="20">4:3 720p 120</option>
+      <option value="21">4:3 960p 120</option>
+      <option value="22">4:3 1080p 120</option>
+      <option value="23">16:9 540p 60</option>
+      <option value="24">16:9 540p 60 50HzAC</option>
+      <option value="25">16:9 720p 60</option>
+      <option value="26">16:9 720p 60 50HzAC</option>
+      <option value="27">16:9 1080p 60</option>
+      <option value="28">16:9 1080p 60 50HzAC</option>
+      <option value="29">16:9 1440p 60</option>
+      <option value="30">16:9 1440p 60 50HzAC</option>
+      <option value="31">16:9 540p 90</option>
+      <option value="32">16:9 540p 90 50HzAC</option>
+      <option value="33">16:9 720p 90</option>
+      <option value="34">16:9 720p 90 50HzAC</option>
+      <option value="35">16:9 1080p 90</option>
+      <option value="36">16:9 1080p 90 50HzAC</option>
+      <option value="37">16:9 1344p 90</option>
+      <option value="38">16:9 1344p 90 50HzAC</option>
+      <option value="39">16:9 540p 120</option>
+      <option value="40">16:9 720p 120</option>
+      <option value="41">16:9 1080p 120</option>
+    </select>
+  </div>
+
+  <!-- OTA -->
+  <div class="row">
+    <button class="btn" onclick="
+      if(confirm('Warning: You are about to perform an OTA upgrade to ' + ota.options[ota.selectedIndex].text + '. Are you sure?')) {
+        goArg('ota', ota.value);
+      }">OTA upgrade</button>
+    <select id="ota">
+      <option value="ota-apfpv">AP-FPV</option>
+      <option value="ota-ruby">Flash Ruby</option>
+      <option value="ota-pnp">Flash &quot;PnP&quot;</option>
+    </select>
+  </div>
+
+  <!-- Show Info -->
+  <div class="row">
+    <button class="btn info" style="width:100%;flex:1"
+            onclick="go('sysinfo')">Show Info</button>
+  </div>
+  <pre class="info-box" id="infoSetup">(no log yet)</pre>
+</div>
+
+<script>
+  // ---------------------------------------------------------------------
+  // TAB SWITCHING
+  // ---------------------------------------------------------------------
+  const tabControl = document.getElementById('tabControl');
+  const tabSetup   = document.getElementById('tabSetup');
+  const contentControl = document.getElementById('contentControl');
+  const contentSetup   = document.getElementById('contentSetup');
+
+  function switchTab(toSetup) {
+    if (toSetup) {
+      tabSetup.classList.add('active');
+      tabControl.classList.remove('active');
+      contentSetup.classList.remove('hidden');
+      contentControl.classList.add('hidden');
+    } else {
+      tabControl.classList.add('active');
+      tabSetup.classList.remove('active');
+      contentControl.classList.remove('hidden');
+      contentSetup.classList.add('hidden');
     }
+    render(lastLog);
+  }
 
-    /* /value/<name> */
-    if (!strncmp(path_start, "/value/", 7)) {
-        char *name = path_start + 7;
+  tabControl.addEventListener('click', () => switchTab(false));
+  tabSetup  .addEventListener('click', () => switchTab(true));
 
-        const char *cmd = NULL;
-        for (size_t k = 0; k < n_vals; ++k)
-            if (!strcmp(vals[k].name, name)) { cmd = vals[k].base; break; }
+  // ---------------------------------------------------------------------
+  // UTIL: debounce – fires at most every delay ms
+  // ---------------------------------------------------------------------
+  function debounce(fn, delay = 200) {
+    let t;
+    return (...args) => {
+      clearTimeout(t);
+      t = setTimeout(() => fn.apply(null, args), delay);
+    };
+  }
 
-        if (!cmd) {
-            dprintf(cfd,
-                    "HTTP/1.0 404 Not Found\r\n\r\nUnknown value %s\n", name);
-            return;
-        }
+  // ---------------------------------------------------------------------
+  // INFO / LOG HANDLING
+  // ---------------------------------------------------------------------
+  let lastLog = '(no log yet)';
+  function render(txt) {
+    lastLog = txt;
+    document.getElementById('infoControl').textContent = txt || '(empty)';
+    document.getElementById('infoSetup').textContent   = txt || '(empty)';
+  }
 
-        FILE *p = popen(cmd, "r");
-        if (!p) {
-            dprintf(cfd,
-                    "HTTP/1.0 500 Internal\r\n\r\nExec failed\n");
-            return;
-        }
+  function updateLog() {
+    fetch('/log')
+      .then(r => r.ok ? r.text() : Promise.reject('HTTP ' + r.status))
+      .then(render)
+      .catch(e => {
+        console.error('Log fetch error:', e);
+        render('Log error: ' + e);
+      });
+  }
 
-        char out[128] = {0};
-        fgets(out, sizeof(out) - 1, p);
-        pclose(p);
-        /* strip trailing CR/LF */
-        size_t L = strlen(out);
-        while (L && (out[L - 1] == '\n' || out[L - 1] == '\r'))
-            out[--L] = 0;
+  function go(name) {
+    fetch('/cmd/' + name)
+      .then(() => updateLog())
+      .catch(e => {
+        console.error('Fetch error:', e);
+        render('Fetch error: ' + e);
+      });
+  }
 
-        dprintf(cfd,
-                "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\n%s\n",
-                out);
-        return;
-    }
+  function goArg(name, arg) {
+    fetch('/cmd/' + name + '?args=' + encodeURIComponent(arg))
+      .then(r => {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        updateLog();
+      })
+      .catch(e => {
+        console.error('Command error:', e);
+        render(`Command "${name}" failed: ${e.message}`);
+      });
+  }
 
-    /* /cmd/<name>[?args=...] */
-    if (!strncmp(path_start, "/cmd/", 5)) {
-        char *name = path_start + 5;
-        char *qs   = strchr(name, '?');
-        if (qs) *qs = 0;
+  // ---------------------------------------------------------------------
+  // THROUGHPUT SLIDER LOGIC
+  // ---------------------------------------------------------------------
+  const throughputSlider = document.getElementById('throughputSlider');
+  const throughputValue  = document.getElementById('throughputValue');
 
-        /* find base */
-        const char *base = NULL;
-        for (size_t k = 0; k < n_cmds; ++k)
-            if (!strcmp(cmds[k].name, name)) { base = cmds[k].base; break; }
-        if (!base) {
-            dprintf(cfd,
-                    "HTTP/1.0 404 Not Found\r\n\r\nUnknown command %s\n",
-                    name);
-            return;
-        }
+  const sendThroughput = () =>
+    goArg('control_cmd', `aalink_throughput ${throughputSlider.value}`);
 
-        /* build final command */
-        char final[CMD_MAXLEN];
-        strncpy(final, base, CMD_MAXLEN - 1);
-        final[CMD_MAXLEN - 1] = 0;
+  const debouncedSendThroughput = debounce(sendThroughput, 200);
 
-        if (qs) {
-            char *arg = strstr(qs + 1, "args=");
-            if (arg) {
-                arg += 5;
-                url_decode(arg);
-                if (!safe_arg(arg)) {
-                    dprintf(cfd,
-                            "HTTP/1.0 400 Bad Request\r\n\r\nBad args\n");
-                    return;
-                }
-                strncat(final, " ", CMD_MAXLEN - 1 - strlen(final));
-                strncat(final, arg, CMD_MAXLEN - 1 - strlen(final));
-            }
-        }
+  throughputSlider.addEventListener('input', () => {
+    throughputValue.textContent = throughputSlider.value;
+    debouncedSendThroughput();
+  });
+  throughputSlider.addEventListener('change', sendThroughput);
 
-        system(final);
+  fetch('/value/aalink_throughput')
+    .then(r => r.ok ? r.text() : Promise.reject('HTTP ' + r.status))
+    .then(v => {
+      const val = parseInt(v, 10);
+      if (!isNaN(val) && val >= 25 && val <= 75) {
+        throughputSlider.value   = val;
+        throughputValue.textContent = val;
+      }
+    })
+    .catch(err => {
+      console.error('Throughput slider init error:', err);
+      render('Throughput slider init error: ' + err);
+    });
 
-        dprintf(cfd,
-                "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\nOK\n");
-        return;
-    }
+  // ---------------------------------------------------------------------
+  // OSD SIZE SLIDER LOGIC
+  // ---------------------------------------------------------------------
+  const osdSlider = document.getElementById('osdSlider');
+  const osdValue  = document.getElementById('osdValue');
 
-    /* fallback */
-    dprintf(cfd, "HTTP/1.0 400 Bad Request\r\n\r\n");
-}
+  const sendOsdSize = () =>
+    goArg('control_cmd', `aalink_font_size ${osdSlider.value}`);
 
-/* -------------------------------------------------------------------------- */
-int main(int argc, char **argv)
-{
-    /* make "web" visible in ps/top/killall */
-    prctl(PR_SET_NAME, "web", 0, 0, 0);
+  const debouncedSendOsdSize = debounce(sendOsdSize, 200);
 
-    /* graceful signals */
-    signal(SIGPIPE, SIG_IGN);
-    signal(SIGTERM, sig_handler);
-    signal(SIGINT , sig_handler);
+  osdSlider.addEventListener('input', () => {
+    osdValue.textContent = osdSlider.value;
+    debouncedSendOsdSize();
+  });
+  osdSlider.addEventListener('change', sendOsdSize);
 
-    const char *html_path = NULL, *cmd_path = NULL;
-    int port = PORT_DEF;
+  fetch('/value/aalink_font_size')
+    .then(r => r.ok ? r.text() : Promise.reject('HTTP ' + r.status))
+    .then(v => {
+      const val = parseInt(v, 10);
+      if (!isNaN(val) && val >= 20 && val <= 60) {
+        osdSlider.value   = val;
+        osdValue.textContent = val;
+      }
+    })
+    .catch(err => {
+      console.error('OSD slider init error:', err);
+      render('OSD slider init error: ' + err);
+    });
 
-    for (int i = 1; i < argc; ++i) {
-        if (!strcmp(argv[i], "--html") && i + 1 < argc) html_path = argv[++i];
-        else if (!strcmp(argv[i], "--commands") && i + 1 < argc)
-            cmd_path = argv[++i];
-        else if (!strcmp(argv[i], "--port") && i + 1 < argc)
-            port = atoi(argv[++i]);
-        else
-            die("Usage: %s --html file --commands file [--port n]\n",
-                argv[0]);
-    }
-    if (!html_path || !cmd_path)
-        die("--html and --commands must be specified\n");
-
-    html_buf = slurp(html_path, &html_len);
-    load_commands(cmd_path);
-
-    /* socket */
-    int sfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sfd < 0) die("socket: %s\n", strerror(errno));
-    int on = 1; setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
-
-    struct sockaddr_in addr = { .sin_family      = AF_INET,
-                                .sin_addr.s_addr = htonl(INADDR_ANY),
-                                .sin_port        = htons(port) };
-    if (bind(sfd, (struct sockaddr *)&addr, sizeof(addr)) < 0 ||
-        listen(sfd, BACKLOG) < 0)
-        die("bind/listen: %s\n", strerror(errno));
-
-    set_nonblock(sfd);
-    printf("tiny_srv: port %d  (html %s, commands %s, log %s)\n",
-           port, html_path, cmd_path, LOG_FILE);
-
-    /* main loop */
-    while (!quit_flag) {
-        fd_set rfds; FD_ZERO(&rfds); FD_SET(sfd, &rfds); int maxfd = sfd;
-
-        struct sockaddr_in cli; socklen_t clilen = sizeof(cli);
-        int cfd;
-        while ((cfd = accept(sfd, (struct sockaddr *)&cli, &clilen)) >= 0) {
-            set_nonblock(cfd); FD_SET(cfd, &rfds); if (cfd > maxfd) maxfd = cfd;
-        }
-
-        int rc = select(maxfd + 1, &rfds, NULL, NULL, NULL);
-        if (rc < 0) {
-            if (errno == EINTR) continue; /* interrupted by signal */
-            die("select: %s\n", strerror(errno));
-        }
-
-        for (int fd = 0; fd <= maxfd; ++fd)
-            if (FD_ISSET(fd, &rfds) && fd != sfd) {
-                handle_request(fd);
-                close(fd);
-            }
-    }
-
-    close(sfd);
-    return 0;
-}
+  // ---------------------------------------------------------------------
+  // INITIALISE PERIODIC LOG POLL
+  // ---------------------------------------------------------------------
+  setInterval(updateLog, 3000);
+  updateLog();
+</script>
+</body>
+</html>
