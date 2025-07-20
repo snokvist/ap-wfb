@@ -1,3 +1,4 @@
+<img width="320" height="241" alt="image" src="https://github.com/user-attachments/assets/ee26b934-49c1-4dcd-95b5-8bbf093c84e4" />
 
 
 # one‑time setup
