@@ -18,42 +18,45 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
 /* ----------------------------- defaults --------------------------------- */
-#define DEF_CFG_FILE     "/etc/antennaosd.conf"
-#define DEF_INFO_FILE    "/proc/net/rtl88x2eu/wlan0/trx_info_debug"
-#define DEF_OUT_FILE     "/tmp/MSPOSD.msg"
-#define DEF_INTERVAL      0.1
-#define DEF_BAR_WIDTH     37
-#define DEF_TOP           80
-#define DEF_BOTTOM        20
+#define DEF_CFG_FILE       "/etc/antennaosd.conf"
+#define DEF_INFO_FILE      "/proc/net/rtl88x2eu/wlan0/trx_info_debug"
+#define DEF_OUT_FILE       "/tmp/MSPOSD.msg"
+#define DEF_INTERVAL        0.1
+#define DEF_BAR_WIDTH       37
+#define DEF_TOP             80
+#define DEF_BOTTOM          20
 
-#define DEF_OSD_HDR       " &F34&L20"   /* default header for line‑1 */
-#define DEF_OSD_HDR2      ""            /* header for stats line     */
-#define DEF_SYS_MSG_HDR   ""            /* header for third line     */
-#define DEF_SYSTEM_MSG    ""            /* text for third line       */
+#define DEF_OSD_HDR         " &F34&L20"
+#define DEF_OSD_HDR2        ""
+#define DEF_SYS_MSG_HDR     ""
+#define DEF_SYS_MSG_TIMEOUT 10         /* system message timeout (seconds) */
 
-#define DEF_RSSI_CONTROL  0             /* 0 = off */
-#define DEF_RSSI_RANGE0   "&F34&L10"
-#define DEF_RSSI_RANGE1   "&F34&L10"
-#define DEF_RSSI_RANGE2   "&F34&L40"
-#define DEF_RSSI_RANGE3   "&F34&L40"
-#define DEF_RSSI_RANGE4   "&F34&L20"
-#define DEF_RSSI_RANGE5   "&F34&L20"
+#define DEF_RSSI_CONTROL    0
+#define DEF_RSSI_RANGE0     "&F34&L10"
+#define DEF_RSSI_RANGE1     "&F34&L10"
+#define DEF_RSSI_RANGE2     "&F34&L40"
+#define DEF_RSSI_RANGE3     "&F34&L40"
+#define DEF_RSSI_RANGE4     "&F34&L20"
+#define DEF_RSSI_RANGE5     "&F34&L20"
 
-#define DEF_PING_IP       "192.168.0.10"
-#define DEF_START         "["
-#define DEF_END           "]"
-#define DEF_EMPTY         "."
-#define DEF_SHOW_STATS    1             /* show stats line by default */
+#define DEF_PING_IP         "192.168.0.10"
+#define DEF_START           "["
+#define DEF_END             "]"
+#define DEF_EMPTY           "."
+#define DEF_SHOW_STATS      1
+
+#define SYS_MSG_FILE        "/tmp/osd_system.msg"
 
 /* ------------------------------ glyphs ---------------------------------- */
 static const char *GL_ANT  = "\uF012";                 /*   */
 static const char *FULL    = "\u2588";                 /* █  */
 static const char *PART[7] = { "\u2581","\u2582","\u2583","\u2584",
-                               "\u2585","\u2586","\u2587" };          /* ▁▂▃▄▅▆▇ */
+                               "\u2585","\u2586","\u2587" };
 
 /* ------------------------------ config ---------------------------------- */
 typedef struct {
@@ -65,18 +68,19 @@ typedef struct {
     int         bottom;
 
     /* headers & optional lines */
-    const char *osd_hdr;          /* line‑1 default header */
-    const char *osd_hdr2;         /* stats header          */
-    const char *sys_msg_hdr;      /* third line header     */
-    const char *system_msg;       /* third line text       */
+    const char *osd_hdr;
+    const char *osd_hdr2;
+    const char *sys_msg_hdr;
+    char        system_msg[256];  /* system message (dynamic) */
     bool        show_stats_line;
+    int         sys_msg_timeout;  /* timeout in seconds */
 
     /* RSSI‑controlled header */
     bool        rssi_control;
     const char *rssi_hdr[6];
 
     /* misc */
-    const char *ping_ip;          /* empty ⇒ disable pings */
+    const char *ping_ip;
     const char *start_sym;
     const char *end_sym;
     const char *empty_sym;
@@ -94,8 +98,9 @@ static cfg_t cfg = {
     .osd_hdr          = DEF_OSD_HDR,
     .osd_hdr2         = DEF_OSD_HDR2,
     .sys_msg_hdr      = DEF_SYS_MSG_HDR,
-    .system_msg       = DEF_SYSTEM_MSG,
+    .system_msg       = "",
     .show_stats_line  = DEF_SHOW_STATS,
+    .sys_msg_timeout  = DEF_SYS_MSG_TIMEOUT,
 
     .rssi_control     = DEF_RSSI_CONTROL,
     .rssi_hdr         = { DEF_RSSI_RANGE0, DEF_RSSI_RANGE1, DEF_RSSI_RANGE2,
@@ -126,8 +131,8 @@ static void set_cfg_field(const char *k,const char *v)
     else if (EQ(k,"osd_hdr"))           cfg.osd_hdr    = strdup(v);
     else if (EQ(k,"osd_hdr2"))          cfg.osd_hdr2   = strdup(v);
     else if (EQ(k,"sys_msg_hdr"))       cfg.sys_msg_hdr= strdup(v);
-    else if (EQ(k,"system_msg"))        cfg.system_msg = strdup(v);
     else if (EQ(k,"show_stats_line"))   cfg.show_stats_line = atoi(v)!=0;
+    else if (EQ(k,"sys_msg_timeout"))   cfg.sys_msg_timeout = atoi(v);
 
     else if (EQ(k,"rssi_control"))      cfg.rssi_control = atoi(v)!=0;
     else if (EQ(k,"rssi_range0_hdr"))   cfg.rssi_hdr[0] = strdup(v);
@@ -161,6 +166,34 @@ static void load_config(const char *path)
         set_cfg_field(k,v);
     }
     free(line); fclose(fp);
+}
+
+/* ---------------------- System Message Handling ------------------------- */
+static time_t sys_msg_last_update = 0;
+
+static void read_system_msg(void) {
+    struct stat st;
+    if (stat(SYS_MSG_FILE, &st) == 0) {
+        if (st.st_mtime != sys_msg_last_update) {
+            FILE *fp = fopen(SYS_MSG_FILE, "r");
+            if (fp) {
+                if (fgets(cfg.system_msg, sizeof(cfg.system_msg), fp)) {
+                    char *p = strchr(cfg.system_msg, '\n');
+                    if (p) *p = '\0';
+                }
+                fclose(fp);
+                sys_msg_last_update = st.st_mtime;
+            }
+        }
+    } else {
+        cfg.system_msg[0] = '\0'; // File missing
+    }
+
+    // Timeout logic
+    time_t now = time(NULL);
+    if (cfg.system_msg[0] && (now - sys_msg_last_update > cfg.sys_msg_timeout)) {
+        cfg.system_msg[0] = '\0';  // Clear message
+    }
 }
 
 /* ----------------------------- helpers ---------------------------------- */
@@ -207,7 +240,7 @@ static void build_bar(char *o,size_t sz,int pct){
 static inline const char *choose_rssi_hdr(int pct)
 {
     if(!cfg.rssi_control) return cfg.osd_hdr;
-    int idx = (pct * 6) / 100;          /* 0‑5 (pct=100 → 6) */
+    int idx = (pct * 6) / 100;
     if(idx > 5) idx = 5;
     return cfg.rssi_hdr[idx];
 }
@@ -224,17 +257,17 @@ static void write_osd(int rssi)
     char bar[cfg.bar_width*3 + 1];
     build_bar(bar, sizeof(bar), pct);
 
-    /* line 1: antenna bar with chosen header */
+    /* line 1: antenna bar */
     const char *hdr = choose_rssi_hdr(pct);
-    fprintf(fp, "%s%s %s%s%s %d%%\n",
-            hdr, GL_ANT, cfg.start_sym, bar, cfg.end_sym, rssi);
+    fprintf(fp, "%s%3d%% %s%s%s\n",
+            hdr, pct, cfg.start_sym, bar, cfg.end_sym);
 
     /* line 2: diagnostics */
     if(cfg.show_stats_line)
-        fprintf(fp, "%sTEMP: &TC/&WC | STATS: &B | CPU: &C\n", cfg.osd_hdr2);
+        fprintf(fp, "%sTEMP: &TC/&WC | &B | CPU: &C\n", cfg.osd_hdr2);
 
-    /* line 3: system message */
-    if(cfg.system_msg && *cfg.system_msg)
+    /* line 3: system message (dynamic) */
+    if(cfg.system_msg[0])
         fprintf(fp, "%s%s\n", cfg.sys_msg_hdr, cfg.system_msg);
 
     fclose(fp);
@@ -245,7 +278,6 @@ int main(int argc,char **argv)
 {
     if(getuid()!=0){ fprintf(stderr,"rssi_bar: run as root (raw sockets)\n"); return 1; }
 
-    /* single flag: --config */
     static const struct option optv[]={
         {"config", required_argument, NULL,'c'},
         {"help",   no_argument,       NULL,'h'},
@@ -274,6 +306,8 @@ int main(int argc,char **argv)
 
     while(true){
         if(ping_en) send_icmp_echo(sock,&dst,seq++);
+
+        read_system_msg();
 
         if(++cnt==3){
             cnt=0;
