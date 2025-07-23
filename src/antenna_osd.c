@@ -260,34 +260,46 @@ static void write_osd(int rssi)
     /* 3) pick header */
     const char *hdr = choose_rssi_hdr(pct);
 
-    /* 4) assemble into one buffer, using "\\n" for literal backslash‑n */
-    char msg[1024];
-    int len = snprintf(msg, sizeof(msg),
-        "%s%3d%% %s%s%s\\n"        /* first line + “\n” */
-        "%sTEMP: &TC/&WC | &B | CPU: &C",  /* second line */
+    /* 4) assemble the *file* buffer with real newlines */
+    char filebuf[1024];
+    int flen = snprintf(filebuf, sizeof(filebuf),
+        "%s%3d%% %s%s%s\n"        /* real '\n' here */
+        "%sTEMP: &TC/&WC | &B | CPU: &C\n",  /* real '\n' here */
         hdr, pct, cfg.start_sym, bar, cfg.end_sym,
         cfg.osd_hdr2
     );
 
-    /* 5) append system message if present */
     if (cfg.system_msg[0]) {
-        len += snprintf(msg + len, sizeof(msg) - len,
-                        "\\n%s%s",         /* literal “\n” + sys_msg_hdr + system_msg */
-                        cfg.sys_msg_hdr, cfg.system_msg);
+        flen += snprintf(filebuf + flen, sizeof(filebuf) - flen,
+                         "%s%s\n",   /* real '\n' here */
+                         cfg.sys_msg_hdr, cfg.system_msg);
     }
 
-    /* 6) print the echo command (with embedded \n) To be added as a deub argument later.
-    printf("echo \"%s\" > %s\n", msg, cfg.out_file); */
+    /* 5) build a *debug* buffer that escapes newlines as \\n */
+    char dbgbuf[2048];
+    char *p = filebuf, *q = dbgbuf;
+    while (p < filebuf + flen && (q - dbgbuf) < (int)sizeof(dbgbuf) - 2) {
+        if (*p == '\n') {
+            *q++ = '\\';  /* backslash */
+            *q++ = 'n';   /* n */
+        } else {
+            *q++ = *p;
+        }
+        p++;
+    }
+    *q = '\0';
 
-    /* 7) write the same raw buffer (with backslash‑n) to the OSD file */
+    /* 6) print the echo -e command (so you see \\n in the debug)
+    printf("echo -e \"%s\" > %s\n", dbgbuf, cfg.out_file); */
+
+    /* 7) write the real bytes (with actual '\n') to the OSD file */
     FILE *fp = fopen(cfg.out_file, "w");
-    if (!fp) {
-        perror("fopen");
-        return;
-    }
-    fwrite(msg, 1, len, fp);
+    if (!fp) { perror("fopen"); return; }
+    fwrite(filebuf, 1, flen, fp);
     fclose(fp);
 }
+
+
 
 
 
