@@ -247,31 +247,49 @@ static inline const char *choose_rssi_hdr(int pct)
 
 static void write_osd(int rssi)
 {
-    FILE *fp=fopen(cfg.out_file,"w"); if(!fp){perror("fopen"); return;}
-
+    /* 1) compute percentage */
     int pct;
     if      (rssi <= cfg.bottom) pct = 0;
     else if (rssi >= cfg.top)    pct = 100;
-    else   pct = (rssi - cfg.bottom) * 100 / (cfg.top - cfg.bottom);
+    else                          pct = (rssi - cfg.bottom) * 100 / (cfg.top - cfg.bottom);
 
+    /* 2) build bar */
     char bar[cfg.bar_width*3 + 1];
     build_bar(bar, sizeof(bar), pct);
 
-    /* line 1: antenna bar */
+    /* 3) pick header */
     const char *hdr = choose_rssi_hdr(pct);
-    fprintf(fp, "%s%3d%% %s%s%s\n",
-            hdr, pct, cfg.start_sym, bar, cfg.end_sym);
 
-    /* line 2: diagnostics */
-    if(cfg.show_stats_line)
-        fprintf(fp, "%sTEMP: &TC/&WC | &B | CPU: &C\n", cfg.osd_hdr2);
+    /* 4) assemble into one buffer, using "\\n" for literal backslash‑n */
+    char msg[1024];
+    int len = snprintf(msg, sizeof(msg),
+        "%s%3d%% %s%s%s\\n"        /* first line + “\n” */
+        "%sTEMP: &TC/&WC | &B | CPU: &C",  /* second line */
+        hdr, pct, cfg.start_sym, bar, cfg.end_sym,
+        cfg.osd_hdr2
+    );
 
-    /* line 3: system message (dynamic) */
-    if(cfg.system_msg[0])
-        fprintf(fp, "%s%s\n", cfg.sys_msg_hdr, cfg.system_msg);
+    /* 5) append system message if present */
+    if (cfg.system_msg[0]) {
+        len += snprintf(msg + len, sizeof(msg) - len,
+                        "\\n%s%s",         /* literal “\n” + sys_msg_hdr + system_msg */
+                        cfg.sys_msg_hdr, cfg.system_msg);
+    }
 
+    /* 6) print the echo command (with embedded \n) To be added as a deub argument later.
+    printf("echo \"%s\" > %s\n", msg, cfg.out_file); */
+
+    /* 7) write the same raw buffer (with backslash‑n) to the OSD file */
+    FILE *fp = fopen(cfg.out_file, "w");
+    if (!fp) {
+        perror("fopen");
+        return;
+    }
+    fwrite(msg, 1, len, fp);
     fclose(fp);
 }
+
+
 
 /* ----------------------------- main ------------------------------------- */
 int main(int argc,char **argv)
