@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -52,6 +53,8 @@
 
 #define SYS_MSG_FILE        "/tmp/osd_system.msg"
 
+#define DEF_RSSI_KEY       "rssi"
+
 /* ------------------------------ glyphs ---------------------------------- */
 static const char *GL_ANT  = "\uF012";                 /*   */
 static const char *FULL    = "\u2588";                 /* █  */
@@ -84,6 +87,8 @@ typedef struct {
     const char *start_sym;
     const char *end_sym;
     const char *empty_sym;
+    const char *rssi_key;
+
 } cfg_t;
 
 /* -------------------- global instance with defaults --------------------- */
@@ -109,7 +114,8 @@ static cfg_t cfg = {
     .ping_ip          = DEF_PING_IP,
     .start_sym        = DEF_START,
     .end_sym          = DEF_END,
-    .empty_sym        = DEF_EMPTY
+    .empty_sym        = DEF_EMPTY,
+    .rssi_key        = DEF_RSSI_KEY
 };
 
 /* ------------ live reload (SIGHUP) -------------------------------------- */
@@ -146,6 +152,8 @@ static void set_cfg_field(const char *k,const char *v)
     else if (EQ(k,"start_sym"))         cfg.start_sym  = strdup(v);
     else if (EQ(k,"end_sym"))           cfg.end_sym    = strdup(v);
     else if (EQ(k,"empty_sym"))         cfg.empty_sym  = strdup(v);
+    else if (EQ(k,"rssi_key"))        cfg.rssi_key      = strdup(v);
+
 #undef EQ
 }
 
@@ -218,12 +226,42 @@ static int send_icmp_echo(int s,struct sockaddr_in *dst,uint16_t seq){
     return sendto(s,&pkt,sizeof(pkt),0,(struct sockaddr*)dst,sizeof(*dst));
 }
 
-static int read_rssi(const char *path){
-    FILE *fp=fopen(path,"r"); if(!fp) return -1;
-    char *l=NULL; size_t n=0; int v=-1;
-    while(getline(&l,&n,fp)!=-1){ char *p=strstr(l,"rssi"); if(!p) continue;
-        if(sscanf(p,"rssi : %d",&v)==1 || sscanf(p,"rssi: %d",&v)==1) break; }
-    free(l); fclose(fp); return v;
+static int read_rssi(const char *path)
+{
+    FILE *fp = fopen(path, "r");
+    if (!fp) return -1;
+
+    char *line = NULL;
+    size_t len = 0;
+    int  value = -1;
+
+    while (getline(&line, &len, fp) != -1) {
+        char *p;
+
+        /* 1) try the configured key (case‑insensitive) */
+        p = strcasestr(line, cfg.rssi_key);
+        if (p) {
+            char *eq = strchr(p, '=');
+            if (eq) {
+                eq++;
+                /* skip whitespace */
+                while (*eq == ' ' || *eq == '\t') eq++;
+                /* atoi()/strtol will stop at the first non‑digit */
+                value = (int)strtol(eq, NULL, 10);
+                break;
+            }
+        }
+
+        /* 2) fallback old-style parsing (lower‑case “rssi : <n>” or “rssi:<n>”) */
+        if (sscanf(line, "rssi : %d", &value) == 1 ||
+            sscanf(line, "rssi: %d",  &value) == 1) {
+            break;
+        }
+    }
+
+    free(line);
+    fclose(fp);
+    return value;
 }
 
 static void build_bar(char *o,size_t sz,int pct){
@@ -290,7 +328,7 @@ static void write_osd(int rssi)
     *q = '\0';
 
     /* 6) print the echo -e command (so you see \\n in the debug)
-    printf("echo -e \"%s\" > %s\n", dbgbuf, cfg.out_file); */
+    printf("echo -e \"%s\" > %s\n", dbgbuf, cfg.out_file);*/
 
     /* 7) write the real bytes (with actual '\n') to the OSD file */
     FILE *fp = fopen(cfg.out_file, "w");
