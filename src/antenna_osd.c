@@ -56,6 +56,8 @@
 #define DEF_RSSI_KEY       "rssi"
 #define DEF_CURR_TX_RATE_KEY  "curr_tx_rate"
 #define DEF_CURR_TX_BW_KEY    "curr_tx_bw"
+#define DEF_RSSI_UDP_ENABLE  0
+#define DEF_RSSI_UDP_KEY     "rssi_udp"
 
 /* ------------------------------ glyphs ---------------------------------- */
 static const char *GL_ANT  = "\uF012";                 /*   */
@@ -92,6 +94,9 @@ typedef struct {
     const char *rssi_key;
     const char *curr_tx_rate_key;
     const char *curr_tx_bw_key;
+    bool        rssi_udp_enable;   /* NEW: show second bar? */
+    const char *rssi_udp_key;      /* NEW: what prefix to look for */
+
 
 } cfg_t;
 
@@ -121,6 +126,8 @@ static cfg_t cfg = {
     .empty_sym        = DEF_EMPTY,
     .curr_tx_rate_key = DEF_CURR_TX_RATE_KEY,
     .curr_tx_bw_key   = DEF_CURR_TX_BW_KEY,
+    .rssi_udp_enable = DEF_RSSI_UDP_ENABLE,
+    .rssi_udp_key    = DEF_RSSI_UDP_KEY,
     .rssi_key        = DEF_RSSI_KEY
 };
 
@@ -161,6 +168,8 @@ static void set_cfg_field(const char *k,const char *v)
     else if (EQ(k,"rssi_key"))        cfg.rssi_key      = strdup(v);
     else if (EQ(k,"curr_tx_rate_key"))  cfg.curr_tx_rate_key = strdup(v);
     else if (EQ(k,"curr_tx_bw_key"))    cfg.curr_tx_bw_key   = strdup(v);
+    else if (EQ(k,"rssi_udp_enable")) cfg.rssi_udp_enable = atoi(v)!=0;
+    else if (EQ(k,"rssi_udp_key"))    cfg.rssi_udp_key    = strdup(v);
 
 #undef EQ
 }
@@ -216,6 +225,32 @@ static void read_system_msg(void) {
 static uint16_t icmp_cksum(const void *d,size_t l){
     const uint8_t *p=d; uint32_t s=0; while(l>1){uint16_t w; memcpy(&w,p,2); s+=w; p+=2; l-=2;} if(l) s+=*p;
     s=(s>>16)+(s&0xFFFF); s+=(s>>16); return (uint16_t)~s;
+}
+
+static int read_key_int(const char *path, const char *key)
+{
+    FILE *fp = fopen(path, "r");
+    if (!fp) return -1;
+
+    char *line = NULL;
+    size_t n = 0;
+    int    val = -1;
+
+    while (getline(&line, &n, fp) != -1) {
+        char *p = strcasestr(line, key);
+        if (!p) continue;
+        /* find either ':' or '=' after the key */
+        char *sep = strchr(p, ':');
+        if (!sep) sep = strchr(p, '=');
+        if (!sep) continue;
+        sep++;
+        while (*sep==' '||*sep=='\t') sep++;
+        val = (int)strtol(sep, NULL, 10);
+        break;
+    }
+    free(line);
+    fclose(fp);
+    return val;
 }
 
 
@@ -321,15 +356,41 @@ static int read_rssi(const char *path)
     return value;
 }
 
-static void build_bar(char *o,size_t sz,int pct){
-    int eig=pct*cfg.bar_width*8/100, full=eig/8, rem=eig%8; size_t pos=0;
-    for(int i=0;i<cfg.bar_width;++i){ const char *sym;
-        if(i<full) sym=FULL;
-        else if(i==full&&rem){ sym=PART[rem-1]; rem=0; }
-        else sym=cfg.empty_sym;
-        size_t L=strlen(sym); if(pos+L<sz){ memcpy(o+pos,sym,L); pos+=L; }
+static void build_bar(char *o, size_t sz, int pct)
+{
+    /* 1) clamp pct to [0..100] */
+    if      (pct <   0) pct =   0;
+    else if (pct > 100) pct = 100;
+
+    /* 2) how many “eighths” of a block we need */
+    int total_eighths = pct * cfg.bar_width * 8 / 100;
+    int full_blocks   = total_eighths / 8;
+    int rem_eighths   = total_eighths % 8;
+
+    /* 3) safety: never exceed bar_width */
+    if (full_blocks > cfg.bar_width) {
+        full_blocks = cfg.bar_width;
+        rem_eighths = 0;
     }
-    o[pos]='\0';
+
+    /* 4) build exactly bar_width symbols */
+    size_t pos = 0;
+    for (int i = 0; i < cfg.bar_width; ++i) {
+        const char *sym = cfg.empty_sym;
+
+        if (i < full_blocks) {
+            sym = FULL;
+        } else if (i == full_blocks && rem_eighths > 0) {
+            sym = PART[rem_eighths - 1];
+        }
+
+        size_t L = strlen(sym);
+        if (pos + L < sz) {
+            memcpy(o + pos, sym, L);
+            pos += L;
+        }
+    }
+    o[pos] = '\0';
 }
 
 static inline const char *choose_rssi_hdr(int pct)
@@ -354,6 +415,21 @@ static void write_osd(int rssi)
     read_key_value(cfg.info_file, cfg.curr_tx_bw_key,   bw_str,   sizeof(bw_str));
 
 
+    /*— NEW: optional “UDP” bar —*/
+    int   udp = 0, pct_udp = 0;
+    char  bar_udp[cfg.bar_width*3 + 1];
+    const char *hdr_udp = NULL;
+    if (cfg.rssi_udp_enable) {
+        udp = read_key_int(cfg.info_file, cfg.rssi_udp_key);
+        if      (udp <= cfg.bottom) pct_udp = 0;
+        else if (udp >= cfg.top)    pct_udp = 100;
+        else                        pct_udp = (udp - cfg.bottom) * 100 / (cfg.top - cfg.bottom);
+        build_bar(bar_udp, sizeof(bar_udp), pct_udp);
+        hdr_udp = choose_rssi_hdr(pct_udp);
+    }
+
+
+
     /* 2) build bar */
     char bar[cfg.bar_width*3 + 1];
     build_bar(bar, sizeof(bar), pct);
@@ -362,21 +438,26 @@ static void write_osd(int rssi)
     const char *hdr = choose_rssi_hdr(pct);
 
     /* 4) assemble the *file* buffer with real newlines */
-    char filebuf[1024];
-    int flen = snprintf(filebuf, sizeof(filebuf),
-        "%s%3d%% %s%s%s\n"                            /* the bar line */
-        "%sTEMP: &TC/&WC | CPU: &C | %s / %s | &B\n",  /* the stats line */
-        hdr, pct,
-        cfg.start_sym, bar, cfg.end_sym,
-        cfg.osd_hdr2,
-        mcs_str, bw_str
-    );
+    char filebuf[2048];
+    int  flen = 0;
 
-    if (cfg.system_msg[0]) {
-        flen += snprintf(filebuf + flen, sizeof(filebuf) - flen,
-                         "%s%s\n",   /* real '\n' here */
-                         cfg.sys_msg_hdr, cfg.system_msg);
+    /* first (main) bar */
+    flen += snprintf(filebuf+flen, sizeof(filebuf)-flen,
+                     "%s %3d%% %s%s%s\n",
+                     hdr, pct, cfg.start_sym, bar, cfg.end_sym);
+
+    /* second (optional) bar */
+    if (cfg.rssi_udp_enable) {
+        flen += snprintf(filebuf+flen, sizeof(filebuf)-flen,
+                         "%s %3d%% %s%s%s\n",
+                         hdr_udp, pct_udp, cfg.start_sym, bar_udp, cfg.end_sym);
     }
+
+    /* stats line (with your MCS/BW bits already added per prior change) */
+    flen += snprintf(filebuf+flen, sizeof(filebuf)-flen,
+                     "%sTEMP: &TC/&WC | CPU: &C | %s / %s | &B\n",
+                     cfg.osd_hdr2,
+                     mcs_str, bw_str);
 
     /* 5) build a *debug* buffer that escapes newlines as \\n */
     char dbgbuf[2048];
@@ -392,8 +473,8 @@ static void write_osd(int rssi)
     }
     *q = '\0';
 
-    /* 6) print the echo -e command (so you see \\n in the debug)
-    printf("echo -e \"%s\" > %s\n", dbgbuf, cfg.out_file);*/
+    /* 6) print the echo -e command (so you see \\n in the debug)*/
+    printf("echo -e \"%s\" > %s\n", dbgbuf, cfg.out_file);
 
     /* 7) write the real bytes (with actual '\n') to the OSD file */
     FILE *fp = fopen(cfg.out_file, "w");
