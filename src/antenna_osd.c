@@ -54,6 +54,8 @@
 #define SYS_MSG_FILE        "/tmp/osd_system.msg"
 
 #define DEF_RSSI_KEY       "rssi"
+#define DEF_CURR_TX_RATE_KEY  "curr_tx_rate"
+#define DEF_CURR_TX_BW_KEY    "curr_tx_bw"
 
 /* ------------------------------ glyphs ---------------------------------- */
 static const char *GL_ANT  = "\uF012";                 /*   */
@@ -88,6 +90,8 @@ typedef struct {
     const char *end_sym;
     const char *empty_sym;
     const char *rssi_key;
+    const char *curr_tx_rate_key;
+    const char *curr_tx_bw_key;
 
 } cfg_t;
 
@@ -115,6 +119,8 @@ static cfg_t cfg = {
     .start_sym        = DEF_START,
     .end_sym          = DEF_END,
     .empty_sym        = DEF_EMPTY,
+    .curr_tx_rate_key = DEF_CURR_TX_RATE_KEY,
+    .curr_tx_bw_key   = DEF_CURR_TX_BW_KEY,
     .rssi_key        = DEF_RSSI_KEY
 };
 
@@ -153,6 +159,8 @@ static void set_cfg_field(const char *k,const char *v)
     else if (EQ(k,"end_sym"))           cfg.end_sym    = strdup(v);
     else if (EQ(k,"empty_sym"))         cfg.empty_sym  = strdup(v);
     else if (EQ(k,"rssi_key"))        cfg.rssi_key      = strdup(v);
+    else if (EQ(k,"curr_tx_rate_key"))  cfg.curr_tx_rate_key = strdup(v);
+    else if (EQ(k,"curr_tx_bw_key"))    cfg.curr_tx_bw_key   = strdup(v);
 
 #undef EQ
 }
@@ -209,6 +217,55 @@ static uint16_t icmp_cksum(const void *d,size_t l){
     const uint8_t *p=d; uint32_t s=0; while(l>1){uint16_t w; memcpy(&w,p,2); s+=w; p+=2; l-=2;} if(l) s+=*p;
     s=(s>>16)+(s&0xFFFF); s+=(s>>16); return (uint16_t)~s;
 }
+
+
+static void read_key_value(const char *path,
+                           const char *key,
+                           char       *out,    /* buffer */
+                           size_t      outlen) {
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        snprintf(out, outlen, "NA");
+        return;
+    }
+    char *line = NULL;
+    size_t n = 0;
+    bool   found = false;
+
+    while (getline(&line, &n, fp) != -1) {
+        char *p = strcasestr(line, key);
+        if (!p) continue;
+
+        /* look for ':' or '=' after the key */
+        char *sep = strchr(p, ':');
+        if (!sep) sep = strchr(p, '=');
+        if (!sep) continue;
+
+        /* skip the separator and any whitespace */
+        sep++;
+        while (*sep == ' ' || *sep == '\t') sep++;
+
+        /* capture up to end‑of‑line or buffer */
+        char *end = sep;
+        while (*end && *end != '\r' && *end != '\n') end++;
+        size_t len = (size_t)(end - sep);
+        if (len >= outlen) len = outlen - 1;
+
+        memcpy(out, sep, len);
+        out[len] = '\0';
+        found = true;
+        break;
+    }
+
+    free(line);
+    fclose(fp);
+
+    if (!found) {
+        snprintf(out, outlen, "NA");
+    }
+}
+
+
 
 static int init_icmp_socket(const char *ip, struct sockaddr_in *dst){
     if(!ip||!*ip) return -1;
@@ -291,6 +348,12 @@ static void write_osd(int rssi)
     else if (rssi >= cfg.top)    pct = 100;
     else                          pct = (rssi - cfg.bottom) * 100 / (cfg.top - cfg.bottom);
 
+
+    char mcs_str[32], bw_str[32];
+    read_key_value(cfg.info_file, cfg.curr_tx_rate_key, mcs_str, sizeof(mcs_str));
+    read_key_value(cfg.info_file, cfg.curr_tx_bw_key,   bw_str,   sizeof(bw_str));
+
+
     /* 2) build bar */
     char bar[cfg.bar_width*3 + 1];
     build_bar(bar, sizeof(bar), pct);
@@ -301,10 +364,12 @@ static void write_osd(int rssi)
     /* 4) assemble the *file* buffer with real newlines */
     char filebuf[1024];
     int flen = snprintf(filebuf, sizeof(filebuf),
-        "%s%3d%% %s%s%s\n"        /* real '\n' here */
-        "%sTEMP: &TC/&WC | &B | CPU: &C\n",  /* real '\n' here */
-        hdr, pct, cfg.start_sym, bar, cfg.end_sym,
-        cfg.osd_hdr2
+        "%s%3d%% %s%s%s\n"                            /* the bar line */
+        "%sTEMP: &TC/&WC | CPU: &C | %s / %s | &B\n",  /* the stats line */
+        hdr, pct,
+        cfg.start_sym, bar, cfg.end_sym,
+        cfg.osd_hdr2,
+        mcs_str, bw_str
     );
 
     if (cfg.system_msg[0]) {
