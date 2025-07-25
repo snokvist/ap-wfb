@@ -28,6 +28,8 @@ static int last_valid_rssi      = 0;
 static int neg1_count_rssi      = 0;
 static int last_valid_udp       = 0;
 static int neg1_count_udp       = 0;
+static char *info_buf   = NULL;
+static size_t info_size = 0;
 
 #define DEF_CFG_FILE       "/etc/antennaosd.conf"
 #define DEF_INFO_FILE      "/proc/net/rtl88x2eu/wlan0/trx_info_debug"
@@ -262,77 +264,75 @@ static int get_display_udp(int raw)
 }
 
 
-static int read_key_int(const char *path, const char *key)
+/**
+ * Read cfg.info_file into info_buf (null-terminated).
+ * Returns true on success, false on error (buffer is left empty).
+ */
+static bool load_info_buffer(void)
 {
-    FILE *fp = fopen(path, "r");
-    if (!fp) return -1;
+    FILE *fp = fopen(cfg.info_file, "r");
+    if (!fp) return false;
 
-    char *line = NULL;
-    size_t n = 0;
-    int    val = -1;
+    fseek(fp, 0, SEEK_END);
+    long sz = ftell(fp);
+    rewind(fp);
 
-    while (getline(&line, &n, fp) != -1) {
-        char *p = strcasestr(line, key);
-        if (!p) continue;
-        /* find either ':' or '=' after the key */
-        char *sep = strchr(p, ':');
-        if (!sep) sep = strchr(p, '=');
-        if (!sep) continue;
-        sep++;
-        while (*sep==' '||*sep=='\t') sep++;
-        val = (int)strtol(sep, NULL, 10);
-        break;
-    }
-    free(line);
+    free(info_buf);
+    info_buf = malloc(sz + 1);
+    if (!info_buf) { fclose(fp); return false; }
+
+    size_t got = fread(info_buf, 1, sz, fp);
     fclose(fp);
-    return val;
+
+    info_buf[got] = '\0';
+    info_size    = got;
+    return true;
+}
+/**
+ * Find “key(:|=)NUM” in info_buf, return NUM or -1.
+ */
+static int parse_int_from_buf(const char *buf, const char *key)
+{
+    const char *p = buf;
+    while ((p = strcasestr(p, key)) != NULL) {
+        const char *sep = strchr(p, ':');
+        if (!sep) sep = strchr(p, '=');
+        if (sep) {
+            sep++;
+            while (*sep==' '||*sep=='\t') sep++;
+            return (int)strtol(sep, NULL, 10);
+        }
+        p += strlen(key);
+    }
+    return -1;
 }
 
 
-static void read_key_value(const char *path,
-                           const char *key,
-                           char       *out,    /* buffer */
-                           size_t      outlen) {
-    FILE *fp = fopen(path, "r");
-    if (!fp) {
-        snprintf(out, outlen, "NA");
-        return;
-    }
-    char *line = NULL;
-    size_t n = 0;
-    bool   found = false;
-
-    while (getline(&line, &n, fp) != -1) {
-        char *p = strcasestr(line, key);
-        if (!p) continue;
-
-        /* look for ':' or '=' after the key */
-        char *sep = strchr(p, ':');
+/**
+ * Find “key(:|=)VALUE…\n” and copy VALUE into out, else “NA”.
+ */
+static void parse_value_from_buf(const char *buf,
+                                 const char *key,
+                                 char       *out,
+                                 size_t      outlen)
+{
+    const char *p = buf;
+    while ((p = strcasestr(p, key)) != NULL) {
+        const char *sep = strchr(p, ':');
         if (!sep) sep = strchr(p, '=');
-        if (!sep) continue;
-
-        /* skip the separator and any whitespace */
+        if (!sep) { p += strlen(key); continue; }
         sep++;
-        while (*sep == ' ' || *sep == '\t') sep++;
-
-        /* capture up to end‑of‑line or buffer */
-        char *end = sep;
-        while (*end && *end != '\r' && *end != '\n') end++;
-        size_t len = (size_t)(end - sep);
+        while (*sep==' '||*sep=='\t') sep++;
+        const char *end = sep;
+        while (*end && *end!='\n' && *end!='\r') end++;
+        size_t len = end - sep;
         if (len >= outlen) len = outlen - 1;
-
         memcpy(out, sep, len);
         out[len] = '\0';
-        found = true;
-        break;
+        return;
     }
-
-    free(line);
-    fclose(fp);
-
-    if (!found) {
-        snprintf(out, outlen, "NA");
-    }
+    /* not found */
+    snprintf(out, outlen, "NA");
 }
 
 
@@ -436,71 +436,74 @@ static inline const char *choose_rssi_hdr(int pct)
     return cfg.rssi_hdr[idx];
 }
 
-static void write_osd(int rssi)
+static void write_osd(int rssi,
+                      int udp_rssi,
+                      const char *mcs_str,
+                      const char *bw_str)
 {
-    /* 1) compute percentage */
+    /* 1) compute main RSSI percentage */
     int pct;
-    if      (rssi <= cfg.bottom) pct = 0;
+    if (rssi < 0)              pct = 0;
+    else if (rssi <= cfg.bottom) pct = 0;
     else if (rssi >= cfg.top)    pct = 100;
     else                          pct = (rssi - cfg.bottom) * 100 / (cfg.top - cfg.bottom);
 
+    /* 2) build main bar */
+    char bar[cfg.bar_width * 3 + 1];
+    build_bar(bar, sizeof(bar), pct);
+    const char *hdr = choose_rssi_hdr(pct);
 
-    char mcs_str[32], bw_str[32];
-    read_key_value(cfg.info_file, cfg.curr_tx_rate_key, mcs_str, sizeof(mcs_str));
-    read_key_value(cfg.info_file, cfg.curr_tx_bw_key,   bw_str,   sizeof(bw_str));
-
-
-    /*— NEW: optional “UDP” bar —*/
-    int   udp = 0, pct_udp = 0;
-    char  bar_udp[cfg.bar_width*3 + 1];
+    /* 3) compute optional UDP‑RSSI percentage and bar */
+    int pct_udp = 0;
+    char bar_udp[cfg.bar_width * 3 + 1];
     const char *hdr_udp = NULL;
     if (cfg.rssi_udp_enable) {
-        udp = read_key_int(cfg.info_file, cfg.rssi_udp_key);
-        if      (udp <= cfg.bottom) pct_udp = 0;
-        else if (udp >= cfg.top)    pct_udp = 100;
-        else                        pct_udp = (udp - cfg.bottom) * 100 / (cfg.top - cfg.bottom);
+        int disp_udp = udp_rssi;
+        if (disp_udp < 0)            pct_udp = 0;
+        else if (disp_udp <= cfg.bottom) pct_udp = 0;
+        else if (disp_udp >= cfg.top)    pct_udp = 100;
+        else                              pct_udp = (disp_udp - cfg.bottom) * 100 / (cfg.top - cfg.bottom);
+
         build_bar(bar_udp, sizeof(bar_udp), pct_udp);
         hdr_udp = choose_rssi_hdr(pct_udp);
     }
 
-
-
-    /* 2) build bar */
-    char bar[cfg.bar_width*3 + 1];
-    build_bar(bar, sizeof(bar), pct);
-
-    /* 3) pick header */
-    const char *hdr = choose_rssi_hdr(pct);
-
-    /* 4) assemble the *file* buffer with real newlines */
+    /* 4) assemble the file buffer with real newlines */
     char filebuf[2048];
-    int  flen = 0;
+    int flen = 0;
 
-    /* first (main) bar */
-    flen += snprintf(filebuf+flen, sizeof(filebuf)-flen,
+    /* first (main) bar line */
+    flen += snprintf(filebuf + flen, sizeof(filebuf) - flen,
                      "%s %3d%% %s%s%s\n",
                      hdr, pct, cfg.start_sym, bar, cfg.end_sym);
 
-    /* second (optional) bar */
+    /* second (optional) UDP bar line */
     if (cfg.rssi_udp_enable) {
-        flen += snprintf(filebuf+flen, sizeof(filebuf)-flen,
+        flen += snprintf(filebuf + flen, sizeof(filebuf) - flen,
                          "%s %3d%% %s%s%s\n",
                          hdr_udp, pct_udp, cfg.start_sym, bar_udp, cfg.end_sym);
     }
 
-    /* stats line (with your MCS/BW bits already added per prior change) */
-    flen += snprintf(filebuf+flen, sizeof(filebuf)-flen,
+    /* stats line with MCS/BW */
+    flen += snprintf(filebuf + flen, sizeof(filebuf) - flen,
                      "%sTEMP: &TC/&WC | CPU: &C | %s / %s | &B\n",
-                     cfg.osd_hdr2,
-                     mcs_str, bw_str);
+                     cfg.osd_hdr2, mcs_str, bw_str);
 
-    /* 5) build a *debug* buffer that escapes newlines as \\n */
-    char dbgbuf[2048];
-    char *p = filebuf, *q = dbgbuf;
+    /* optional system message */
+    if (cfg.system_msg[0]) {
+        flen += snprintf(filebuf + flen, sizeof(filebuf) - flen,
+                         "%s%s\n",
+                         cfg.sys_msg_hdr, cfg.system_msg);
+    }
+
+    /* 5) build a debug buffer escaping newlines as “\\n” */
+    char dbgbuf[4096];
+    char *p = filebuf;
+    char *q = dbgbuf;
     while (p < filebuf + flen && (q - dbgbuf) < (int)sizeof(dbgbuf) - 2) {
         if (*p == '\n') {
-            *q++ = '\\';  /* backslash */
-            *q++ = 'n';   /* n */
+            *q++ = '\\';
+            *q++ = 'n';
         } else {
             *q++ = *p;
         }
@@ -508,16 +511,19 @@ static void write_osd(int rssi)
     }
     *q = '\0';
 
-    /* 6) print the echo -e command (so you see \\n in the debug)*/
-    printf("echo -e \"%s\" > %s\n", dbgbuf, cfg.out_file);
+    /* (optional) debug print:
+       printf("echo -e \"%s\" > %s\n", dbgbuf, cfg.out_file);
+    */
 
-    /* 7) write the real bytes (with actual '\n') to the OSD file */
+    /* 6) write the real bytes (with actual '\n') to the OSD file */
     FILE *fp = fopen(cfg.out_file, "w");
-    if (!fp) { perror("fopen"); return; }
+    if (!fp) {
+        perror("fopen");
+        return;
+    }
     fwrite(filebuf, 1, flen, fp);
     fclose(fp);
 }
-
 
 
 
@@ -561,18 +567,34 @@ int main(int argc,char **argv)
         if (++cnt == 3) {
             cnt = 0;
 
-            /* read raw and smooth it */
-            int raw_rssi = read_rssi(cfg.info_file);
-            int disp_rssi = get_display_rssi(raw_rssi);
+            /* 1) read the proc file into memory once */
+            load_info_buffer();
 
-            write_osd(disp_rssi);
+            /* 2) parse raw values from that buffer */
+            int raw_rssi  = parse_int_from_buf(info_buf, cfg.rssi_key);
+            int raw_udp   = cfg.rssi_udp_enable
+                            ? parse_int_from_buf(info_buf, cfg.rssi_udp_key)
+                            : -1;
+
+            char mcs_str[32], bw_str[32];
+            parse_value_from_buf(info_buf, cfg.curr_tx_rate_key,
+                                 mcs_str, sizeof(mcs_str));
+            parse_value_from_buf(info_buf, cfg.curr_tx_bw_key,
+                                 bw_str,   sizeof(bw_str));
+
+            /* 3) apply your “–1 smoothing” on raw_rssi/raw_udp */
+            int disp_rssi = get_display_rssi(raw_rssi);
+            int disp_udp  = get_display_udp(raw_udp);
+
+            /* 4) hand disp_rssi into write_osd (which also
+             *    builds the optional UDP bar from disp_udp) */
+            write_osd(disp_rssi, disp_udp, mcs_str, bw_str);
         }
 
         nanosleep(&ts, NULL);
 
         if (reload_cfg) {
             reload_cfg = 0;
-            fprintf(stderr, "[antenna_osd] reload %s\n", cfg_path);
             load_config(cfg_path);
         }
     }
