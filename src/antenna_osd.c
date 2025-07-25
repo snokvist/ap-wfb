@@ -502,7 +502,25 @@ static void write_osd(int rssi,
                          "%s%s\n", cfg.sys_msg_hdr, cfg.system_msg);
     }
 
-    /* 5) (debug buffer escape omitted here for brevity) */
+
+    /* 5) build a debug buffer escaping newlines as “\\n”
+    char dbgbuf[4096];
+    char *p = filebuf;
+    char *q = dbgbuf;
+    while (p < filebuf + flen && (q - dbgbuf) < (int)sizeof(dbgbuf) - 2) {
+        if (*p == '\n') {
+            *q++ = '\\';
+            *q++ = 'n';
+        } else {
+            *q++ = *p;
+        }
+        p++;
+    }
+    *q = '\0';
+
+    /* (optional) debug print:*/
+     /*  printf("echo -e \"%s\" > %s\n", dbgbuf, cfg.out_file);*/
+
 
     /* 6) write out */
     FILE *fp = fopen(cfg.out_file, "w");
