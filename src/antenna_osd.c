@@ -439,14 +439,15 @@ static inline const char *choose_rssi_hdr(int pct)
 static void write_osd(int rssi,
                       int udp_rssi,
                       const char *mcs_str,
-                      const char *bw_str)
+                      const char *bw_str,
+                      const char *txp_str)
 {
     /* 1) compute main RSSI percentage */
     int pct;
-    if (rssi < 0)              pct = 0;
-    else if (rssi <= cfg.bottom) pct = 0;
-    else if (rssi >= cfg.top)    pct = 100;
-    else                          pct = (rssi - cfg.bottom) * 100 / (cfg.top - cfg.bottom);
+    if      (rssi < 0             ) pct = 0;
+    else if (rssi <= cfg.bottom   ) pct = 0;
+    else if (rssi >= cfg.top      ) pct = 100;
+    else                              pct = (rssi - cfg.bottom) * 100 / (cfg.top - cfg.bottom);
 
     /* 2) build main bar */
     char bar[cfg.bar_width * 3 + 1];
@@ -459,9 +460,9 @@ static void write_osd(int rssi,
     const char *hdr_udp = NULL;
     if (cfg.rssi_udp_enable) {
         int disp_udp = udp_rssi;
-        if (disp_udp < 0)            pct_udp = 0;
+        if      (disp_udp < 0           ) pct_udp = 0;
         else if (disp_udp <= cfg.bottom) pct_udp = 0;
-        else if (disp_udp >= cfg.top)    pct_udp = 100;
+        else if (disp_udp >= cfg.top   ) pct_udp = 100;
         else                              pct_udp = (disp_udp - cfg.bottom) * 100 / (cfg.top - cfg.bottom);
 
         build_bar(bar_udp, sizeof(bar_udp), pct_udp);
@@ -470,7 +471,7 @@ static void write_osd(int rssi,
 
     /* 4) assemble the file buffer with real newlines */
     char filebuf[2048];
-    int flen = 0;
+    int  flen = 0;
 
     /* first (main) bar line */
     flen += snprintf(filebuf + flen, sizeof(filebuf) - flen,
@@ -484,38 +485,23 @@ static void write_osd(int rssi,
                          hdr_udp, pct_udp, cfg.start_sym, bar_udp, cfg.end_sym);
     }
 
-    /* stats line with MCS/BW */
+    /* 5) stats line with MCS / BW / TX_POWER */
     flen += snprintf(filebuf + flen, sizeof(filebuf) - flen,
-                     "%sTEMP: &TC/&WC | CPU: &C | %s / %s | &B\n",
-                     cfg.osd_hdr2, mcs_str, bw_str);
+                     "%sTEMP: &TC/&WC | CPU: &C | %s / %s / %s | &B\n",
+                     cfg.osd_hdr2,
+                     mcs_str,
+                     bw_str,
+                     txp_str);
 
-    /* optional system message */
+    /* 6) optional system message */
     if (cfg.system_msg[0]) {
         flen += snprintf(filebuf + flen, sizeof(filebuf) - flen,
                          "%s%s\n",
-                         cfg.sys_msg_hdr, cfg.system_msg);
+                         cfg.sys_msg_hdr,
+                         cfg.system_msg);
     }
 
-    /* 5) build a debug buffer escaping newlines as “\\n” */
-    char dbgbuf[4096];
-    char *p = filebuf;
-    char *q = dbgbuf;
-    while (p < filebuf + flen && (q - dbgbuf) < (int)sizeof(dbgbuf) - 2) {
-        if (*p == '\n') {
-            *q++ = '\\';
-            *q++ = 'n';
-        } else {
-            *q++ = *p;
-        }
-        p++;
-    }
-    *q = '\0';
-
-    /* (optional) debug print:
-       printf("echo -e \"%s\" > %s\n", dbgbuf, cfg.out_file);
-    */
-
-    /* 6) write the real bytes (with actual '\n') to the OSD file */
+    /* 7) write to the OSD file */
     FILE *fp = fopen(cfg.out_file, "w");
     if (!fp) {
         perror("fopen");
@@ -585,10 +571,12 @@ int main(int argc,char **argv)
             /* 3) apply your “–1 smoothing” on raw_rssi/raw_udp */
             int disp_rssi = get_display_rssi(raw_rssi);
             int disp_udp  = get_display_udp(raw_udp);
+            char txp_str[32];
+            parse_value_from_buf(info_buf, "tx_power", txp_str, sizeof(txp_str));
 
             /* 4) hand disp_rssi into write_osd (which also
              *    builds the optional UDP bar from disp_udp) */
-            write_osd(disp_rssi, disp_udp, mcs_str, bw_str);
+            write_osd(disp_rssi, disp_udp, mcs_str, bw_str, txp_str);
         }
 
         nanosleep(&ts, NULL);
