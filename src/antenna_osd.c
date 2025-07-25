@@ -65,6 +65,7 @@ static size_t info_size = 0;
 #define DEF_CURR_TX_BW_KEY    "curr_tx_bw"
 #define DEF_RSSI_UDP_ENABLE  0
 #define DEF_RSSI_UDP_KEY     "rssi_udp"
+#define DEF_TX_POWER_KEY   "tx_power"
 
 /* ------------------------------ glyphs ---------------------------------- */
 static const char *GL_ANT  = "\uF012";                 /*   */
@@ -103,6 +104,7 @@ typedef struct {
     const char *curr_tx_bw_key;
     bool        rssi_udp_enable;   /* NEW: show second bar? */
     const char *rssi_udp_key;      /* NEW: what prefix to look for */
+    const char *tx_power_key;
 
 } cfg_t;
 
@@ -134,7 +136,9 @@ static cfg_t cfg = {
     .curr_tx_bw_key   = DEF_CURR_TX_BW_KEY,
     .rssi_udp_enable = DEF_RSSI_UDP_ENABLE,
     .rssi_udp_key    = DEF_RSSI_UDP_KEY,
+    .tx_power_key    = DEF_TX_POWER_KEY,
     .rssi_key        = DEF_RSSI_KEY
+
 };
 
 /* ------------ live reload (SIGHUP) -------------------------------------- */
@@ -176,6 +180,7 @@ static void set_cfg_field(const char *k,const char *v)
     else if (EQ(k,"curr_tx_bw_key"))    cfg.curr_tx_bw_key   = strdup(v);
     else if (EQ(k,"rssi_udp_enable")) cfg.rssi_udp_enable = atoi(v)!=0;
     else if (EQ(k,"rssi_udp_key"))    cfg.rssi_udp_key    = strdup(v);
+    else if (EQ(k,"tx_power_key"))     cfg.tx_power_key = strdup(v);
 
 #undef EQ
 }
@@ -440,76 +445,72 @@ static void write_osd(int rssi,
                       int udp_rssi,
                       const char *mcs_str,
                       const char *bw_str,
-                      const char *txp_str)
+                      const char *tx_str)
 {
     /* 1) compute main RSSI percentage */
     int pct;
-    if      (rssi < 0             ) pct = 0;
-    else if (rssi <= cfg.bottom   ) pct = 0;
-    else if (rssi >= cfg.top      ) pct = 100;
-    else                              pct = (rssi - cfg.bottom) * 100 / (cfg.top - cfg.bottom);
+    if      (rssi < 0               ) pct = 0;
+    else if (rssi <= cfg.bottom    ) pct = 0;
+    else if (rssi >= cfg.top       ) pct = 100;
+    else                               pct = (rssi - cfg.bottom) * 100 / (cfg.top - cfg.bottom);
 
     /* 2) build main bar */
     char bar[cfg.bar_width * 3 + 1];
     build_bar(bar, sizeof(bar), pct);
     const char *hdr = choose_rssi_hdr(pct);
 
-    /* 3) compute optional UDP‑RSSI percentage and bar */
+    /* 3) optional UDP‑RSSI bar */
     int pct_udp = 0;
     char bar_udp[cfg.bar_width * 3 + 1];
     const char *hdr_udp = NULL;
     if (cfg.rssi_udp_enable) {
         int disp_udp = udp_rssi;
-        if      (disp_udp < 0           ) pct_udp = 0;
-        else if (disp_udp <= cfg.bottom) pct_udp = 0;
-        else if (disp_udp >= cfg.top   ) pct_udp = 100;
-        else                              pct_udp = (disp_udp - cfg.bottom) * 100 / (cfg.top - cfg.bottom);
+        if      (disp_udp < 0            ) pct_udp = 0;
+        else if (disp_udp <= cfg.bottom ) pct_udp = 0;
+        else if (disp_udp >= cfg.top    ) pct_udp = 100;
+        else                               pct_udp = (disp_udp - cfg.bottom) * 100 / (cfg.top - cfg.bottom);
 
         build_bar(bar_udp, sizeof(bar_udp), pct_udp);
         hdr_udp = choose_rssi_hdr(pct_udp);
     }
 
-    /* 4) assemble the file buffer with real newlines */
+    /* 4) assemble the file buffer */
     char filebuf[2048];
     int  flen = 0;
 
-    /* first (main) bar line */
+    /* — main bar line — */
     flen += snprintf(filebuf + flen, sizeof(filebuf) - flen,
                      "%s %3d%% %s%s%s\n",
                      hdr, pct, cfg.start_sym, bar, cfg.end_sym);
 
-    /* second (optional) UDP bar line */
+    /* — UDP bar line if enabled — */
     if (cfg.rssi_udp_enable) {
         flen += snprintf(filebuf + flen, sizeof(filebuf) - flen,
                          "%s %3d%% %s%s%s\n",
                          hdr_udp, pct_udp, cfg.start_sym, bar_udp, cfg.end_sym);
     }
 
-    /* 5) stats line with MCS / BW / TX_POWER */
+    /* — stats line with MCS / BW / TX_POWER — */
     flen += snprintf(filebuf + flen, sizeof(filebuf) - flen,
                      "%sTEMP: &TC/&WC | CPU: &C | %s / %s / %s | &B\n",
                      cfg.osd_hdr2,
-                     mcs_str,
-                     bw_str,
-                     txp_str);
+                     mcs_str, bw_str, tx_str);
 
-    /* 6) optional system message */
+    /* — optional system message — */
     if (cfg.system_msg[0]) {
         flen += snprintf(filebuf + flen, sizeof(filebuf) - flen,
-                         "%s%s\n",
-                         cfg.sys_msg_hdr,
-                         cfg.system_msg);
+                         "%s%s\n", cfg.sys_msg_hdr, cfg.system_msg);
     }
 
-    /* 7) write to the OSD file */
+    /* 5) (debug buffer escape omitted here for brevity) */
+
+    /* 6) write out */
     FILE *fp = fopen(cfg.out_file, "w");
-    if (!fp) {
-        perror("fopen");
-        return;
-    }
+    if (!fp) { perror("fopen"); return; }
     fwrite(filebuf, 1, flen, fp);
     fclose(fp);
 }
+
 
 
 
@@ -571,12 +572,12 @@ int main(int argc,char **argv)
             /* 3) apply your “–1 smoothing” on raw_rssi/raw_udp */
             int disp_rssi = get_display_rssi(raw_rssi);
             int disp_udp  = get_display_udp(raw_udp);
-            char txp_str[32];
-            parse_value_from_buf(info_buf, "tx_power", txp_str, sizeof(txp_str));
-
+            char tx_str[32];
+            parse_value_from_buf(info_buf, cfg.tx_power_key,
+                                tx_str, sizeof(tx_str));
             /* 4) hand disp_rssi into write_osd (which also
              *    builds the optional UDP bar from disp_udp) */
-            write_osd(disp_rssi, disp_udp, mcs_str, bw_str, txp_str);
+            write_osd(disp_rssi, disp_udp, mcs_str, bw_str, tx_str);
         }
 
         nanosleep(&ts, NULL);
