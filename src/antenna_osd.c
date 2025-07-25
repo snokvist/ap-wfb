@@ -24,6 +24,11 @@
 #include <unistd.h>
 
 /* ----------------------------- defaults --------------------------------- */
+static int last_valid_rssi      = 0;
+static int neg1_count_rssi      = 0;
+static int last_valid_udp       = 0;
+static int neg1_count_udp       = 0;
+
 #define DEF_CFG_FILE       "/etc/antennaosd.conf"
 #define DEF_INFO_FILE      "/proc/net/rtl88x2eu/wlan0/trx_info_debug"
 #define DEF_OUT_FILE       "/tmp/MSPOSD.msg"
@@ -96,7 +101,6 @@ typedef struct {
     const char *curr_tx_bw_key;
     bool        rssi_udp_enable;   /* NEW: show second bar? */
     const char *rssi_udp_key;      /* NEW: what prefix to look for */
-
 
 } cfg_t;
 
@@ -226,6 +230,37 @@ static uint16_t icmp_cksum(const void *d,size_t l){
     const uint8_t *p=d; uint32_t s=0; while(l>1){uint16_t w; memcpy(&w,p,2); s+=w; p+=2; l-=2;} if(l) s+=*p;
     s=(s>>16)+(s&0xFFFF); s+=(s>>16); return (uint16_t)~s;
 }
+
+
+static int get_display_rssi(int raw)
+{
+    if (raw >= 0) {
+        last_valid_rssi = raw;
+        neg1_count_rssi = 0;
+        return raw;
+    }
+    /* raw == –1 */
+    if (++neg1_count_rssi >= 3) {
+        /* now give up and show –1 */
+        return -1;
+    }
+    /* still in grace period: show last valid */
+    return last_valid_rssi;
+}
+
+static int get_display_udp(int raw)
+{
+    if (raw >= 0) {
+        last_valid_udp = raw;
+        neg1_count_udp = 0;
+        return raw;
+    }
+    if (++neg1_count_udp >= 3) {
+        return -1;
+    }
+    return last_valid_udp;
+}
+
 
 static int read_key_int(const char *path, const char *key)
 {
@@ -518,23 +553,26 @@ int main(int argc,char **argv)
                         .tv_nsec=(long)((ping_int-(time_t)ping_int)*1e9)};
     int cnt=0;
 
-    while(true){
-        if(ping_en) send_icmp_echo(sock,&dst,seq++);
+    while (true) {
+        if (ping_en) send_icmp_echo(sock, &dst, seq++);
 
         read_system_msg();
 
-        if(++cnt==3){
-            cnt=0;
-            int r=read_rssi(cfg.info_file);
-            if(r<0) r=0;
-            write_osd(r);
+        if (++cnt == 3) {
+            cnt = 0;
+
+            /* read raw and smooth it */
+            int raw_rssi = read_rssi(cfg.info_file);
+            int disp_rssi = get_display_rssi(raw_rssi);
+
+            write_osd(disp_rssi);
         }
 
-        nanosleep(&ts,NULL);
+        nanosleep(&ts, NULL);
 
-        if(reload_cfg){
-            reload_cfg=0;
-            fprintf(stderr,"[antenna_osd] reload %s\n",cfg_path);
+        if (reload_cfg) {
+            reload_cfg = 0;
+            fprintf(stderr, "[antenna_osd] reload %s\n", cfg_path);
             load_config(cfg_path);
         }
     }
