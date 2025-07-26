@@ -34,6 +34,7 @@ static size_t info_size = 0;
 static time_t last_info_attempt = 0;
 static bool   info_buf_valid   = false;
 
+
 #define DEF_CFG_FILE       "/etc/antennaosd.conf"
 #define DEF_INFO_FILE      "/proc/net/rtl88x2eu/wlan0/trx_info_debug"
 #define DEF_OUT_FILE       "/tmp/MSPOSD.msg"
@@ -397,11 +398,22 @@ static void parse_value_from_buf(const char *buf,
 
 
 
-static int init_icmp_socket(const char *ip, struct sockaddr_in *dst){
-    if(!ip||!*ip) return -1;
-    int s=socket(AF_INET,SOCK_RAW,IPPROTO_ICMP); if(s<0){perror("socket"); return -1;}
-    memset(dst,0,sizeof(*dst)); dst->sin_family=AF_INET;
-    if(inet_pton(AF_INET,ip,&dst->sin_addr)!=1){fprintf(stderr,"Invalid ping_ip \"%s\"\n",ip); close(s); return -1;}
+static int init_icmp_socket(const char *ip, struct sockaddr_in *dst) {
+    if (!ip || !*ip) return -1;
+
+    int s = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    if (s < 0) {
+        perror("socket");
+        return -1;
+    }
+
+    memset(dst, 0, sizeof(*dst));
+    dst->sin_family = AF_INET;
+    if (inet_pton(AF_INET, ip, &dst->sin_addr) != 1) {
+        fprintf(stderr, "[warning] invalid ping_ip \"%s\", ICMP disabled\n", ip);
+        close(s);
+        return -1;
+    }
     return s;
 }
 
@@ -663,6 +675,16 @@ int main(int argc,char **argv)
         if (reload_cfg) {
             reload_cfg = 0;
             load_config(cfg_path);
+            
+            if (cfg.bar_width < 1) {
+                cfg.bar_width = DEF_BAR_WIDTH;
+            } else if (cfg.bar_width > 200) {
+                cfg.bar_width = 200;
+            }
+            
+            
+            
+            
         }
     }
 }
