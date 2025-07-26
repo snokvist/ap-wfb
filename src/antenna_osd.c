@@ -34,7 +34,6 @@ static size_t info_size = 0;
 static time_t last_info_attempt = 0;
 static bool   info_buf_valid   = false;
 
-
 #define DEF_CFG_FILE       "/etc/antennaosd.conf"
 #define DEF_INFO_FILE      "/proc/net/rtl88x2eu/wlan0/trx_info_debug"
 #define DEF_OUT_FILE       "/tmp/MSPOSD.msg"
@@ -259,20 +258,6 @@ static int get_display_rssi(int raw)
     return last_valid_rssi;
 }
 
-static int get_display_udp(int raw)
-{
-    if (raw >= 0) {
-        last_valid_udp = raw;
-        neg1_count_udp = 0;
-        return raw;
-    }
-    if (++neg1_count_udp >= 3) {
-        return -1;
-    }
-    return last_valid_udp;
-}
-
-
 /**
  * Read cfg.info_file into info_buf (null-terminated).
  * Returns true on success, false on error (buffer is left empty).
@@ -300,6 +285,45 @@ static bool load_info_buffer(void)
 
 
 
+ /**
+  * Try to load cfg.info_file, but only once every 3 seconds UNTIL we succeed.
+  * Returns true if we have ever successfully loaded the file.
+  */
+ static bool try_initial_load_info(void) {
+     time_t now = time(NULL);
+     if (info_buf_valid) {
+         return true;
+     }
+     if (now - last_info_attempt < 3) {
+         return false;
+     }
+     last_info_attempt = now;
+     if (load_info_buffer()) {
+         info_buf_valid = true;
+         return true;
+     }
+     return false;
+ }
+
+
+static int get_display_udp(int raw)
+{
+    if (raw >= 0) {
+        last_valid_udp = raw;
+        neg1_count_udp = 0;
+        return raw;
+    }
+    if (++neg1_count_udp >= 3) {
+        return -1;
+    }
+    return last_valid_udp;
+}
+
+
+
+
+
+
 /**
  * Find “key(:|=)NUM” in info_buf, return NUM or -1.
  */
@@ -318,56 +342,6 @@ static int parse_int_from_buf(const char *buf, const char *key)
     }
     return -1;
 }
-
-/**
- * Try to (re)load cfg.info_file, but only once every 3 seconds.
- * Returns true if `info_buf` contains valid data (fresh or stale),
- * false if we have no data yet (and so parsing must be skipped).
- */
-static bool maybe_reload_info_buffer(void) {
-    time_t now = time(NULL);
-
-    /* 1) If we already successfully loaded this file once, keep using it. */
-    if (info_buf_valid) {
-        /* But if you want to re‑refresh every time it changes, clear this flag when
-           you detect st_mtime changes, similar to your sys_msg logic. */
-        return true;
-    }
-
-    /* 2) Only try again if ≥3 seconds have elapsed since last attempt */
-    if (now - last_info_attempt < 3) {
-        return false;
-    }
-    last_info_attempt = now;
-
-    /* 3) Attempt the real load */
-    FILE *fp = fopen(cfg.info_file, "r");
-    if (!fp) {
-        /* still not there—skip parsing */
-        return false;
-    }
-
-    /* read whole file into buffer */
-    fseek(fp, 0, SEEK_END);
-    long sz = ftell(fp);
-    rewind(fp);
-
-    free(info_buf);
-    info_buf = malloc(sz + 1);
-    if (!info_buf) {
-        fclose(fp);
-        return false;
-    }
-
-    size_t got = fread(info_buf, 1, sz, fp);
-    fclose(fp);
-    info_buf[got]  = '\0';
-    info_size      = got;
-    info_buf_valid = true;    /* now future calls will immediately succeed */
-    return true;
-}
-
-
 
 /**
  * Find “key(:|=)VALUE…\n” and copy VALUE into out, else “NA”.
@@ -556,12 +530,13 @@ static void write_osd(int rssi,
                          "%s %3d%% %s%s%s\n",
                          hdr_udp, pct_udp, cfg.start_sym, bar_udp, cfg.end_sym);
     }
-
-    /* — stats line with MCS / BW / TX_POWER — */
-    flen += snprintf(filebuf + flen, sizeof(filebuf) - flen,
-                     "%sTEMP: &TC/&WC | CPU: &C | %s / %s / %s | &B\n",
-                     cfg.osd_hdr2,
-                     mcs_str, bw_str, tx_str);
+    /* — optional stats line with MCS / BW / TX_POWER — */
+    if (cfg.show_stats_line) {
+        flen += snprintf(filebuf + flen, sizeof(filebuf) - flen,
+                         "%sTEMP: &TC/&WC | CPU: &C | %s / %s / %s | &B\n",
+                         cfg.osd_hdr2,
+                         mcs_str, bw_str, tx_str);
+    }
 
     /* — optional system message — */
     if (cfg.system_msg[0]) {
@@ -639,16 +614,23 @@ int main(int argc,char **argv)
         if (++cnt == 3) {
             cnt = 0;
 
-        /* 1) try loading/parsing the proc file (with back‑off) */
-        if (!maybe_reload_info_buffer()) {
-            /* we have no valid data yet—skip this cycle */
-            continue;
-        }
+    /* 1) ensure we’ve ever loaded the info file at least once */
+    if (!try_initial_load_info()) {
+        continue;  // still in back‑off / no data yet
+    }
+
+    /* 2) from now on, read it every cycle (≈0.1s) */
+    if (!load_info_buffer()) {
+        // if a sudden read error happens, mark invalid and restart back‑off
+        info_buf_valid = false;
+        last_info_attempt = time(NULL);
+        continue;
+    }
         /* 2) now `info_buf` is guaranteed non-NULL: */
         int raw_rssi  = parse_int_from_buf(info_buf, cfg.rssi_key);
 
-            
-            
+
+
             int raw_udp   = cfg.rssi_udp_enable
                             ? parse_int_from_buf(info_buf, cfg.rssi_udp_key)
                             : -1;
@@ -675,16 +657,16 @@ int main(int argc,char **argv)
         if (reload_cfg) {
             reload_cfg = 0;
             load_config(cfg_path);
-            
+
             if (cfg.bar_width < 1) {
                 cfg.bar_width = DEF_BAR_WIDTH;
             } else if (cfg.bar_width > 200) {
                 cfg.bar_width = 200;
             }
-            
-            
-            
-            
+
+
+
+
         }
     }
 }
