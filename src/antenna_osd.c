@@ -33,6 +33,8 @@ static char *info_buf   = NULL;
 static size_t info_size = 0;
 static time_t last_info_attempt = 0;
 static bool   info_buf_valid   = false;
+static int rssi_hist[3] = { -1, -1, -1 };
+static int udp_hist[3]  = { -1, -1, -1 };
 
 #define DEF_CFG_FILE       "/etc/antennaosd.conf"
 #define DEF_INFO_FILE      "/proc/net/rtl88x2eu/wlan0/trx_info_debug"
@@ -239,6 +241,22 @@ static void read_system_msg(void) {
 static uint16_t icmp_cksum(const void *d,size_t l){
     const uint8_t *p=d; uint32_t s=0; while(l>1){uint16_t w; memcpy(&w,p,2); s+=w; p+=2; l-=2;} if(l) s+=*p;
     s=(s>>16)+(s&0xFFFF); s+=(s>>16); return (uint16_t)~s;
+}
+
+
+static int smooth_rssi_sample(int *hist, int newval)
+{
+    if (newval < 0) return newval; // do not smooth invalid values
+
+    // shift history
+    hist[2] = hist[1];
+    hist[1] = hist[0];
+    hist[0] = newval;
+
+    if (hist[1] < 0 || hist[2] < 0)
+        return newval; // not enough history yet
+
+    return (int)(0.5 * hist[0] + 0.25 * hist[1] + 0.25 * hist[2]);
 }
 
 
@@ -643,7 +661,14 @@ int main(int argc,char **argv)
 
             /* 3) apply your “–1 smoothing” on raw_rssi/raw_udp */
             int disp_rssi = get_display_rssi(raw_rssi);
+            disp_rssi = smooth_rssi_sample(rssi_hist, disp_rssi);
+
             int disp_udp  = get_display_udp(raw_udp);
+            disp_udp = smooth_rssi_sample(udp_hist, disp_udp);
+
+
+
+
             char tx_str[32];
             parse_value_from_buf(info_buf, cfg.tx_power_key,
                                 tx_str, sizeof(tx_str));
