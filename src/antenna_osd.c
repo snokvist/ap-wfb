@@ -1,3 +1,4 @@
+
 /*
  * rssi_bar.c – RSSI bar OSD + background ICMP traffic generator
  * -------------------------------------------------------------------------
@@ -30,6 +31,8 @@ static int last_valid_udp       = 0;
 static int neg1_count_udp       = 0;
 static char *info_buf   = NULL;
 static size_t info_size = 0;
+static time_t last_info_attempt = 0;
+static bool   info_buf_valid   = false;
 
 #define DEF_CFG_FILE       "/etc/antennaosd.conf"
 #define DEF_INFO_FILE      "/proc/net/rtl88x2eu/wlan0/trx_info_debug"
@@ -293,6 +296,9 @@ static bool load_info_buffer(void)
     info_size    = got;
     return true;
 }
+
+
+
 /**
  * Find “key(:|=)NUM” in info_buf, return NUM or -1.
  */
@@ -311,6 +317,55 @@ static int parse_int_from_buf(const char *buf, const char *key)
     }
     return -1;
 }
+
+/**
+ * Try to (re)load cfg.info_file, but only once every 3 seconds.
+ * Returns true if `info_buf` contains valid data (fresh or stale),
+ * false if we have no data yet (and so parsing must be skipped).
+ */
+static bool maybe_reload_info_buffer(void) {
+    time_t now = time(NULL);
+
+    /* 1) If we already successfully loaded this file once, keep using it. */
+    if (info_buf_valid) {
+        /* But if you want to re‑refresh every time it changes, clear this flag when
+           you detect st_mtime changes, similar to your sys_msg logic. */
+        return true;
+    }
+
+    /* 2) Only try again if ≥3 seconds have elapsed since last attempt */
+    if (now - last_info_attempt < 3) {
+        return false;
+    }
+    last_info_attempt = now;
+
+    /* 3) Attempt the real load */
+    FILE *fp = fopen(cfg.info_file, "r");
+    if (!fp) {
+        /* still not there—skip parsing */
+        return false;
+    }
+
+    /* read whole file into buffer */
+    fseek(fp, 0, SEEK_END);
+    long sz = ftell(fp);
+    rewind(fp);
+
+    free(info_buf);
+    info_buf = malloc(sz + 1);
+    if (!info_buf) {
+        fclose(fp);
+        return false;
+    }
+
+    size_t got = fread(info_buf, 1, sz, fp);
+    fclose(fp);
+    info_buf[got]  = '\0';
+    info_size      = got;
+    info_buf_valid = true;    /* now future calls will immediately succeed */
+    return true;
+}
+
 
 
 /**
@@ -572,11 +627,16 @@ int main(int argc,char **argv)
         if (++cnt == 3) {
             cnt = 0;
 
-            /* 1) read the proc file into memory once */
-            load_info_buffer();
+        /* 1) try loading/parsing the proc file (with back‑off) */
+        if (!maybe_reload_info_buffer()) {
+            /* we have no valid data yet—skip this cycle */
+            continue;
+        }
+        /* 2) now `info_buf` is guaranteed non-NULL: */
+        int raw_rssi  = parse_int_from_buf(info_buf, cfg.rssi_key);
 
-            /* 2) parse raw values from that buffer */
-            int raw_rssi  = parse_int_from_buf(info_buf, cfg.rssi_key);
+            
+            
             int raw_udp   = cfg.rssi_udp_enable
                             ? parse_int_from_buf(info_buf, cfg.rssi_udp_key)
                             : -1;
