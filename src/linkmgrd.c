@@ -379,11 +379,12 @@ static void json_status(struct cfg *C, char *out)
 
     for (int i = 0; i < C->nsta; i++)
         n += sprintf(out + n,
-            "%s{\"ip\":\"%s\",\"rssi\":%d,\"fail\":%d}",
+            "%s{\"ip\":\"%s\",\"rssi\":%d,\"fail\":%d,\"succ\":%d}",
             i ? "," : "",
             C->s[i].ip,
             EFFECTIVE_RSSI(C->s[i], *C),
-            C->s[i].fail);                 /* ← was  .ping_fail */
+            C->s[i].fail,              /* time‑outs in a row   */
+            C->s[i].succ);             /* successes in a row   */
 
     sprintf(out + n, "]}\n");
 }
