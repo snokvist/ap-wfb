@@ -27,6 +27,8 @@
 #define BUF_SZ    4096
 #define LN_SZ     256
 #define CFG_DEF   "/etc/linkmgrd.conf"
+#define EFFECTIVE_RSSI(sta, cfg) \
+        (((sta).ping_fail >= (cfg).g.ping_fail_max) ? -10000 : (sta).rssi)
 
 static volatile int g_run = 1;
 static int  g_verbose    = 0;
@@ -205,14 +207,25 @@ static int ping_alive(const char *ip, int timeout_ms)
 static void ping_poll(struct cfg *C)
 {
     for (int i = 0; i < C->nsta; i++) {
+        /* ── probe ─────────────────────────────────────────────────── */
         int alive = ping_alive(C->s[i].ip, C->g.ping_to_ms);
+
         if (alive) C->s[i].ping_fail = 0;
-        else if (C->s[i].ping_fail < 255) C->s[i].ping_fail++;
-        if (g_verbose)
-            printf("[ping] %s %s (fail %d)\n",
-                   C->s[i].ip, alive ? "OK" : "timeout", C->s[i].ping_fail);
+        else if (C->s[i].ping_fail < 255)
+            C->s[i].ping_fail++;
+
+        /* ── console output (verbose) ──────────────────────────────── */
+        if (g_verbose) {
+            int er = EFFECTIVE_RSSI(C->s[i], *C);   /* masked RSSI */
+            printf("[ping] %s %s  rssi=%d  fail=%d\n",
+                   C->s[i].ip,
+                   alive ? "OK" : "timeout",
+                   er,
+                   C->s[i].ping_fail);
+        }
     }
 }
+
 
 /* ───────────────────────── route helpers ─────────────────────────────── */
 static void master_route(struct cfg *C, const char *gw)
@@ -246,30 +259,29 @@ static void route_watchdog(struct cfg *C)
 /* ───────────────────────── decision engine ───────────────────────────── */
 static void decide(struct cfg *C)
 {
-    /* suppress STA whose ping_fail exceeded limit */
-    for (int i = 0; i < C->nsta; i++)
-        if (C->s[i].ping_fail >= C->g.ping_fail_max)
-            C->s[i].rssi = -10000;
+    if (*C->via) {
+        for (int i = 0; i < C->nsta; i++)
+            if (!strcmp(C->via, C->s[i].ip) &&
+                EFFECTIVE_RSSI(C->s[i], *C) >= C->g.floor_db)
+                return;                        /* don’t switch */
+    }
 
-    /* floor guard */
-    int cur = -1;
-    for (int i = 0; i < C->nsta; i++)
-        if (*C->via && !strcmp(C->via, C->s[i].ip)) { cur = i; break; }
-    if (cur >= 0 && C->s[cur].rssi >= C->g.floor_db) return;
+    /* find best usable link */
+    int best = -10000; char best_ip[64] = "";
+    for (int i = 0; i < C->nsta; i++) {
+        int er = EFFECTIVE_RSSI(C->s[i], *C);
+        if (er > best) { best = er; strcpy(best_ip, C->s[i].ip); }
+    }
 
-    /* find best */
-    int best = -10000; char cand[64] = "";
-    for (int i = 0; i < C->nsta; i++)
-        if (C->s[i].rssi > best) { best = C->s[i].rssi; strcpy(cand, C->s[i].ip); }
-
-    if (best <= -1000) {                       /* none usable */
+    if (best <= -1000) {                       /* nothing usable */
         if (*C->via) { *C->via = 0; master_route(C, ""); }
         return;
     }
 
     /* hysteresis window */
+    char cand[64] = "";
     for (int i = 0; i < C->nsta; i++)
-        if (best - C->s[i].rssi < C->g.hyst_db)
+        if (best - EFFECTIVE_RSSI(C->s[i], *C) < C->g.hyst_db)
             strncpy(cand, C->s[i].ip, 63);
 
     static char last[64] = "";
@@ -315,7 +327,10 @@ static void json_status(struct cfg *C, char *out)
     for (int i = 0; i < C->nsta; i++)
         n += sprintf(out + n,
             "%s{\"ip\":\"%s\",\"rssi\":%d,\"fail\":%d}",
-            i ? "," : "", C->s[i].ip, C->s[i].rssi, C->s[i].ping_fail);
+            i ? "," : "",
+            C->s[i].ip,
+            EFFECTIVE_RSSI(C->s[i], *C),
+            C->s[i].ping_fail);
 
     sprintf(out + n, "]}\n");
 }
