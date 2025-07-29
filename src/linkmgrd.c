@@ -28,7 +28,7 @@
 #define LN_SZ     256
 #define CFG_DEF   "/etc/linkmgrd.conf"
 #define EFFECTIVE_RSSI(sta, cfg) \
-        (((sta).ping_fail >= (cfg).g.ping_fail_max) ? -10000 : (sta).rssi)
+        (((sta).fail >= (cfg).g.ping_fail_max) ? -10000 : (sta).rssi)
 
 static volatile int g_run = 1;
 static int  g_verbose    = 0;
@@ -39,13 +39,15 @@ struct gcfg {
     int  floor_db;
     int  http_port;
     int  ping_to_ms, ping_fail_max;
+    int  ping_succ_min;
     char html[PATH_MAX];
     char master_if[32];
 };
 struct sta {
     char ip[64], mac[32];
     int  rssi;
-    int  ping_fail;                  /* consecutive ping time-outs        */
+    uint8_t fail;    /* consecutive time-outs          */
+    uint8_t succ;    /* consecutive successes          */
 };
 struct cfg {
     struct gcfg g;
@@ -93,6 +95,7 @@ static int ini_load(const char *fn, struct cfg *C)
             else if (!strcmp(k, "ping_timeout_ms"))    C->g.ping_to_ms = atoi(v);
             else if (!strcmp(k, "ping_fail_max"))      C->g.ping_fail_max = atoi(v);
             else if (!strcmp(k, "html_path"))          strncpy(C->g.html, v, PATH_MAX - 1);
+            else if (!strcmp(k, "ping_succ_min"))      C->g.ping_succ_min = atoi(v);
             else if (!strcmp(k, "master_iface"))       strncpy(C->g.master_if, v, 31);
 
         } else if (!strncmp(sec, "sta", 3)) {
@@ -209,35 +212,26 @@ static int ping_alive(const char *ip, int timeout_ms)
 }
 static void ping_poll(struct cfg *C)
 {
-    /* remembers consecutive successes per STA */
-    static uint8_t ok_streak[MAX_STA] = {0};
-
     for (int i = 0; i < C->nsta; i++) {
-        int alive = ping_alive(C->s[i].ip, C->g.ping_to_ms);
+        struct sta *s = &C->s[i];
+
+        int alive = ping_alive(s->ip, C->g.ping_to_ms);
 
         if (alive) {
-            if (ok_streak[i] < 255) ok_streak[i]++;
-
-            /* clear fault after ping_fail_max consecutive OKs */
-            if (ok_streak[i] >= C->g.ping_fail_max) {
-                C->s[i].ping_fail = 0;
-            } else if (C->s[i].ping_fail > 0) {
-                C->s[i].ping_fail--;             /* gentle decay */
-            }
-        } else {                                 /* timeout */
-            ok_streak[i] = 0;                    /* break streak */
-            if (C->s[i].ping_fail < 255)
-                C->s[i].ping_fail++;
+            s->succ++;
+            if (s->fail) s->fail = 0;               /* clear fail streak   */
+        } else {
+            s->fail++;
+            s->succ = 0;                            /* break success streak*/
         }
+        if (s->fail > 255) s->fail = 255;
+        if (s->succ > 255) s->succ = 255;
 
-        /* verbose console line uses masked RSSI */
         if (g_verbose) {
-            int er = EFFECTIVE_RSSI(C->s[i], *C);
-            printf("[ping] %s %s  rssi=%d  fail=%d\n",
-                   C->s[i].ip,
-                   alive ? "OK" : "timeout",
-                   er,
-                   C->s[i].ping_fail);
+            int er = EFFECTIVE_RSSI(*s, *C);
+            printf("[ping] %s %s  rssi=%d  fail=%d succ=%d\n",
+                   s->ip, alive ? "OK" : "timeout",
+                   er, s->fail, s->succ);
         }
     }
 }
@@ -303,17 +297,37 @@ static void decide(struct cfg *C)
         int er = EFFECTIVE_RSSI(C->s[i], *C);
         if (er > best) { best = er; strcpy(best_ip, C->s[i].ip); }
     }
+    /* -------------------------------------------------------------- */
+    /*  no *usable* link?  → keep the STA with the strongest raw RSSI  */
+    /* -------------------------------------------------------------- */
+    if (best <= -1000) {                 /* every link currently masked */
 
-    if (best <= -1000) {                       /* nothing usable */
-        if (*C->via) {                         /* clear default route */
-            *C->via = 0;
-            master_route(C, "");
+        /* pick the STA whose raw RSSI (un‑masked) is highest */
+        int best_raw  = -10000;
+        int best_idx  = -1;
+        for (int i = 0; i < C->nsta; i++)
+            if (C->s[i].rssi > best_raw) {
+                best_raw = C->s[i].rssi;
+                best_idx = i;
+            }
+
+        /* fall back to that STA, even though it’s “bad” */
+        if (best_idx >= 0 &&
+            strcmp(C->via, C->s[best_idx].ip)) {
+
+            strcpy(C->via, C->s[best_idx].ip);
+            master_route(C, C->via);
+            if (g_verbose)
+                printf("[force] keeping worst link via %s (raw rssi %d)\n",
+                       C->via, best_raw);
         }
-        /* reset hysteresis state so next good link can start fresh */
+
+        /* reset hysteresis so a real good link can switch in quickly */
         last[0] = '\0';
         t0      = 0;
         return;
     }
+
 
     /* hysteresis window */
     char cand[64] = "";
@@ -327,6 +341,10 @@ static void decide(struct cfg *C)
         if (!t0) t0 = now;
         if (now - t0 >= C->g.hyst_ms) {
             strcpy(last, cand); strcpy(C->via, cand);
+            /* clear counters on the chosen link */
+            for (int i = 0; i < C->nsta; i++)
+                if (!strcmp(cand, C->s[i].ip))
+                    C->s[i].fail = C->s[i].succ = 0;
             master_route(C, cand);
             if (g_verbose) printf("[switch] via %s (rssi %d)\n", cand, best);
             t0 = 0;
@@ -365,7 +383,7 @@ static void json_status(struct cfg *C, char *out)
             i ? "," : "",
             C->s[i].ip,
             EFFECTIVE_RSSI(C->s[i], *C),
-            C->s[i].ping_fail);
+            C->s[i].fail);                 /* ← was  .ping_fail */
 
     sprintf(out + n, "]}\n");
 }
@@ -423,6 +441,7 @@ int main(int argc, char **argv)
     C.g.http_port     = 8080;
     C.g.ping_to_ms    = 700;
     C.g.ping_fail_max = 3;
+    C.g.ping_succ_min = 2;
     strcpy(C.g.master_if, "wlan0");
     strcpy(C.g.html, "/etc/linkmgrd.html");
 
