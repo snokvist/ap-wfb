@@ -244,16 +244,22 @@ static void ping_poll(struct cfg *C)
 
 
 
-/* ───────────────────────── route helpers ─────────────────────────────── */
+/* ───────── replace default route on the master ───────── */
 static void master_route(struct cfg *C, const char *gw)
 {
     char cmd[256];
-    snprintf(cmd, sizeof cmd, "ip route del default dev %s 2>/dev/null",
-             C->g.master_if);
-    system(cmd);
-    if (!*gw) return;
-    snprintf(cmd, sizeof cmd, "ip route add default via %s dev %s",
-             gw, C->g.master_if);
+
+    if (*gw) {
+        /* atomically overwrite any existing default */
+        snprintf(cmd, sizeof cmd,
+                 "ip route replace default via %s dev %s metric 0",
+                 gw, C->g.master_if);
+    } else {
+        /* no usable link: remove the WLAN default */
+        snprintf(cmd, sizeof cmd,
+                 "ip route del default dev %s 2>/dev/null",
+                 C->g.master_if);
+    }
     system(cmd);
 }
 static int route_is_ok(struct cfg *C, const char *gw)
