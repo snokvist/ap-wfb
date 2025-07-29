@@ -276,6 +276,10 @@ static void route_watchdog(struct cfg *C)
 /* ───────────────────────── decision engine ───────────────────────────── */
 static void decide(struct cfg *C)
 {
+
+    static char last[64] = "";
+    static long t0 = 0;
+
     if (*C->via) {
         for (int i = 0; i < C->nsta; i++)
             if (!strcmp(C->via, C->s[i].ip) &&
@@ -291,7 +295,13 @@ static void decide(struct cfg *C)
     }
 
     if (best <= -1000) {                       /* nothing usable */
-        if (*C->via) { *C->via = 0; master_route(C, ""); }
+        if (*C->via) {                         /* clear default route */
+            *C->via = 0;
+            master_route(C, "");
+        }
+        /* reset hysteresis state so next good link can start fresh */
+        last[0] = '\0';
+        t0      = 0;
         return;
     }
 
@@ -301,8 +311,6 @@ static void decide(struct cfg *C)
         if (best - EFFECTIVE_RSSI(C->s[i], *C) < C->g.hyst_db)
             strncpy(cand, C->s[i].ip, 63);
 
-    static char last[64] = "";
-    static long t0 = 0;
     long now = ms_now();
 
     if (strcmp(cand, last)) {
