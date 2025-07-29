@@ -1,15 +1,6 @@
-/* linkmgrd.c — single‑file UDP‑link fail‑over daemon
- * ---------------------------------------------------
- *   roles : master | sta      (configured in INI)
- *   metric: RSSI + dBm / time hysteresis
- *   API   : HTTP/1.0  (GET /status , POST /update)
- *   build : gcc -O2 -Wall -o linkmgrd linkmgrd.c
- *
- * summary of operation
- *   • master polls its AP radio (iw station dump), compares RSSI, pushes /update to STAs
- *   • each STA polls its own interface (iw link) and obeys /update to rewrite a /32 route
- *   • no STA‑>master “report” traffic is required
- *   • verbose mode prints every poll, MAC addresses, and route switches
+/* linkmgrd.c — master-only fail-over daemon
+ * -----------------------------------------
+ * Build:  gcc -O2 -Wall -o linkmgrd linkmgrd.c
  */
 
 #define _GNU_SOURCE
@@ -25,7 +16,10 @@
 #include <sys/socket.h>
 #include <sys/select.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <netinet/in.h>
+#include <netinet/ip.h>
+#include <netinet/ip_icmp.h>
 #include <arpa/inet.h>
 #include <limits.h>
 
@@ -36,15 +30,35 @@
 
 static volatile int g_run = 1;
 static int  g_verbose    = 0;
+
+/* ───────────────────────── data structures ───────────────────────────── */
+struct gcfg {
+    int  poll_ms, hyst_ms, hyst_db;
+    int  floor_db;
+    int  http_port;
+    int  ping_to_ms, ping_fail_max;
+    char html[PATH_MAX];
+    char master_if[32];
+};
+struct sta {
+    char ip[64], mac[32];
+    int  rssi;
+    int  ping_fail;                  /* consecutive ping time-outs        */
+};
+struct cfg {
+    struct gcfg g;
+    int  nsta;
+    struct sta s[MAX_STA];
+    char via[64];                    /* current default gateway IP        */
+};
+
+/* ───────────────────────── helpers ───────────────────────────────────── */
 static long ms_now(void)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
+    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
     return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
 }
 static void sig_hdl(int s) { (void)s; g_run = 0; }
-
-/* strip inline “;” or “#” comments and trim whitespace */
 static void trim(char *s)
 {
     char *c = strpbrk(s, ";#"); if (c) *c = 0;
@@ -53,28 +67,7 @@ static void trim(char *s)
     while (*s && strchr(" \t", *s)) memmove(s, s + 1, strlen(s));
 }
 
-/* ------------------------------------------------------------------ config */
-struct gcfg {
-    char role[8];
-    int  poll_ms, hyst_ms, hyst_db;
-    int  http_port, http_to;
-    char html[PATH_MAX];
-    char master_if[32];          /* interface polled on master */
-};
-struct sta {
-    char ifc[32], ip[64], mac[32];
-    int  rssi; long inact;
-    unsigned long rx, tx;
-};
-struct cfg {
-    struct gcfg g;
-    char master_ip[64];
-    char csv[256];               /* master: list from stas= */
-    int  nsta;                   /* number of [staX] blocks */
-    struct sta s[MAX_STA];
-    char via[64];                /* master’s current active link */
-};
-
+/* ───────────────────────── INI parser ─────────────────────────────────── */
 static int ini_load(const char *fn, struct cfg *C)
 {
     FILE *f = fopen(fn, "r");
@@ -90,27 +83,21 @@ static int ini_load(const char *fn, struct cfg *C)
         *eq = 0; char *k = ln, *v = eq + 1; trim(k); trim(v);
 
         if (!strcmp(sec, "general")) {
-            if      (!strcmp(k, "role"))               strncpy(C->g.role, v, 7);
-            else if (!strcmp(k, "poll_interval_ms"))   C->g.poll_ms  = atoi(v);
+            if      (!strcmp(k, "poll_interval_ms"))   C->g.poll_ms  = atoi(v);
             else if (!strcmp(k, "hysteresis_ms"))      C->g.hyst_ms  = atoi(v);
             else if (!strcmp(k, "hysteresis_db"))      C->g.hyst_db  = atoi(v);
+            else if (!strcmp(k, "switch_floor_db"))    C->g.floor_db = atoi(v);
             else if (!strcmp(k, "http_port"))          C->g.http_port = atoi(v);
-            else if (!strcmp(k, "http_timeout_s"))     C->g.http_to   = atoi(v);
+            else if (!strcmp(k, "ping_timeout_ms"))    C->g.ping_to_ms = atoi(v);
+            else if (!strcmp(k, "ping_fail_max"))      C->g.ping_fail_max = atoi(v);
             else if (!strcmp(k, "html_path"))          strncpy(C->g.html, v, PATH_MAX - 1);
-
-        } else if (!strcmp(sec, "master")) {
-            if      (!strcmp(k, "stas"))               strncpy(C->csv, v, 255);
             else if (!strcmp(k, "master_iface"))       strncpy(C->g.master_if, v, 31);
-
-        } else if (!strcmp(sec, "sta")) {
-            if (!strcmp(k, "master_ip"))               strncpy(C->master_ip, v, 63);
 
         } else if (!strncmp(sec, "sta", 3)) {
             int i = C->nsta; if (i >= MAX_STA) continue;
-            if      (!strcmp(k, "iface")) strncpy(C->s[i].ifc, v, 31);
-            else if (!strcmp(k, "ip"))    strncpy(C->s[i].ip,  v, 63);
-            else if (!strcmp(k, "mac"))   strncpy(C->s[i].mac, v, 31);
-            if (*C->s[i].ifc && *C->s[i].ip && *C->s[i].mac) C->nsta = i + 1;
+            if      (!strcmp(k, "ip"))  strncpy(C->s[i].ip,  v, 63);
+            else if (!strcmp(k, "mac")) strncpy(C->s[i].mac, v, 31);
+            if (*C->s[i].ip && *C->s[i].mac) C->nsta = i + 1;
         }
     }
     fclose(f);
@@ -118,156 +105,169 @@ static int ini_load(const char *fn, struct cfg *C)
     return 0;
 }
 
-/* ------------------------------------------------------------------ helpers */
-static int exec_line(const char *cmd, const char *key, char *out, size_t len)
+/* ───────────────────────── RSSI polling via iw ───────────────────────── */
+static void rssi_poll(struct cfg *C)
 {
-    FILE *p = popen(cmd, "r"); if (!p) return -1;
-    char b[LN_SZ]; int ok = -1;
-    while (fgets(b, sizeof b, p))
-        if (strstr(b, key)) { strncpy(out, b, len - 1); ok = 0; break; }
+    char cmd[128];
+    snprintf(cmd, sizeof cmd, "iw dev %s station dump", C->g.master_if);
+
+    int fds[2]; pid_t pid;
+    if (pipe(fds) || (pid = fork()) < 0) { perror("pipe/fork"); return; }
+
+    if (pid == 0) {                       /* child */
+        close(fds[0]); dup2(fds[1], STDOUT_FILENO); close(fds[1]);
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL); _exit(127);
+    }
+    close(fds[1]);
+
+    FILE *p = fdopen(fds[0], "r");
+    if (!p) { close(fds[0]); return; }
+
+    for (int i = 0; i < C->nsta; i++) C->s[i].rssi = -10000;
+
+    char l[LN_SZ], mac[32] = ""; int rssi = -10000;
+
+    auto void commit(const char *m)
+    {
+        if (!*m) return;
+        for (int i = 0; i < C->nsta; i++)
+            if (!strcasecmp(m, C->s[i].mac)) { C->s[i].rssi = rssi; break; }
+    }
+
+    struct timespec ts0; clock_gettime(CLOCK_MONOTONIC, &ts0);
+    int lc = 0;
+    while (fgets(l, sizeof l, p)) {
+        if ((++lc & 15) == 0) {
+            struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+            long ms = (ts.tv_sec - ts0.tv_sec) * 1000L +
+                      (ts.tv_nsec - ts0.tv_nsec) / 1000000L;
+            if (ms > 300) break;
+        }
+        char new_mac[32];
+        if (sscanf(l, "Station %31s", new_mac) == 1) {
+            commit(mac); strcpy(mac, new_mac); rssi = -10000; continue;
+        }
+        if (strstr(l, "signal")) sscanf(l, "%*s %d", &rssi);
+    }
+    commit(mac);
+
+    fclose(p); kill(pid, SIGKILL); waitpid(pid, NULL, 0);
+}
+
+/* ───────────────────────── tiny raw-socket ICMP ping ──────────────────── */
+static uint16_t csum16(const void *v, size_t len)
+{
+    const uint16_t *p = v; uint32_t sum = 0;
+    while (len > 1) { sum += *p++; len -= 2; }
+    if (len) sum += *(uint8_t *)p;
+    sum = (sum >> 16) + (sum & 0xffff);
+    sum += (sum >> 16);
+    return (uint16_t)~sum;
+}
+static int ping_alive(const char *ip, int timeout_ms)
+{
+    int sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    if (sock < 0) return 0;
+
+    struct timeval tv = { timeout_ms / 1000,
+                          (timeout_ms % 1000) * 1000 };
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+
+    struct sockaddr_in dst = {0};
+    dst.sin_family = AF_INET; inet_aton(ip, &dst.sin_addr);
+
+    uint8_t pkt[64] = {0};
+    struct icmphdr *h = (struct icmphdr *)pkt;
+    h->type = ICMP_ECHO; h->code = 0;
+    h->un.echo.id = htons(getpid() & 0xffff);
+    h->un.echo.sequence = htons(1);
+    h->checksum = csum16(pkt, sizeof pkt);
+
+    int ok = sendto(sock, pkt, sizeof pkt, 0,
+                    (struct sockaddr *)&dst, sizeof dst) >= 0;
+
+    if (ok) {
+        uint8_t buf[128];
+        struct sockaddr_in sfrom; socklen_t sl = sizeof sfrom;
+        ok = 0;
+        if (recvfrom(sock, buf, sizeof buf, 0,
+                     (struct sockaddr *)&sfrom, &sl) >= (ssize_t)sizeof(struct ip))
+        {
+            struct icmphdr *rh = (struct icmphdr *)(buf + sizeof(struct ip));
+            if (rh->type == ICMP_ECHOREPLY &&
+                rh->un.echo.id == h->un.echo.id)
+                ok = 1;
+        }
+    }
+    close(sock);
+    return ok;
+}
+static void ping_poll(struct cfg *C)
+{
+    for (int i = 0; i < C->nsta; i++) {
+        int alive = ping_alive(C->s[i].ip, C->g.ping_to_ms);
+        if (alive) C->s[i].ping_fail = 0;
+        else if (C->s[i].ping_fail < 255) C->s[i].ping_fail++;
+        if (g_verbose)
+            printf("[ping] %s %s (fail %d)\n",
+                   C->s[i].ip, alive ? "OK" : "timeout", C->s[i].ping_fail);
+    }
+}
+
+/* ───────────────────────── route helpers ─────────────────────────────── */
+static void master_route(struct cfg *C, const char *gw)
+{
+    char cmd[256];
+    snprintf(cmd, sizeof cmd, "ip route del default dev %s 2>/dev/null",
+             C->g.master_if);
+    system(cmd);
+    if (!*gw) return;
+    snprintf(cmd, sizeof cmd, "ip route add default via %s dev %s",
+             gw, C->g.master_if);
+    system(cmd);
+}
+static int route_is_ok(struct cfg *C, const char *gw)
+{
+    FILE *p = popen("ip route show default", "r");
+    if (!p) return 0;
+    char l[256]; int ok = 0;
+    while (fgets(l, sizeof l, p))
+        if (strstr(l, gw) && strstr(l, C->g.master_if)) { ok = 1; break; }
     pclose(p); return ok;
 }
-static void dev_stats(const char *ifc, unsigned long *rx, unsigned long *tx)
+static void route_watchdog(struct cfg *C)
 {
-    FILE *f = fopen("/proc/net/dev", "r"); if (!f) return;
-    char l[LN_SZ]; fgets(l, LN_SZ, f); fgets(l, LN_SZ, f);
-    while (fgets(l, LN_SZ, f))
-        if (strstr(l, ifc) == l) {
-            unsigned long rxb, rxp, txb, txp;
-            sscanf(l + strlen(ifc) + 1,
-                   "%lu %lu %*u %*u %*u %*u %*u %*u %lu %lu",
-                   &rxb, &rxp, &txb, &txp);
-            *rx = rxp; *tx = txp; break;
-        }
-    fclose(f);
+    if (!*C->via) return;
+    if (route_is_ok(C, C->via)) return;
+    if (g_verbose) fprintf(stderr, "[route] watchdog: repairing table\n");
+    master_route(C, C->via);
 }
 
-/* ------------------------------------------------------------------ polling – STA */
-static void sta_poll(struct cfg *C)
-{
-    for (int i = 0; i < C->nsta; i++) {
-        struct sta *s = &C->s[i];
-        char cmd[128], ln[LN_SZ];
-
-        snprintf(cmd, sizeof cmd, "iw dev %s link", s->ifc);
-        s->rssi  = exec_line(cmd, "signal", ln, sizeof ln) ? -10000
-                  : (sscanf(ln, "%*s %d", &s->rssi), s->rssi);
-
-        s->inact = exec_line(cmd, "inactive time", ln, sizeof ln) ? -1
-                  : (sscanf(ln, "%*s %*s %ld", &s->inact), s->inact);
-
-        dev_stats(s->ifc, &s->rx, &s->tx);
-
-        if (g_verbose)
-            printf("[sta] %-10s mac=%s rssi=%d ina=%ld rx=%lu tx=%lu\n",
-                   s->ifc, s->mac, s->rssi, s->inact, s->rx, s->tx);
-    }
-}
-
-/* linkmgrd.c — July 28 2025, blank‑line‑free station‑dump parser */
-//  (same header & includes as before)  …
-// ---------- unchanged code until mst_poll() ------------------
-
-static void mst_poll(struct cfg *C)
-{
-    char cmd[128]; snprintf(cmd,sizeof cmd,"iw dev %s station dump",C->g.master_if);
-    FILE *p = popen(cmd,"r"); if(!p){ if(g_verbose) puts("[mst] dump fail"); return; }
-
-    /* mark all unseen */
-    for(int i=0;i<C->nsta;i++){ C->s[i].rssi=-10000; C->s[i].inact=-1; }
-
-    char l[LN_SZ], mac[32]=""; int rssi=-10000; long ina=-1;
-
-    /* helper commits one finished block */
-    void store(const char *m){
-        if(!*m) return;
-        for(int i=0;i<C->nsta;i++)
-            if(!strcasecmp(m,C->s[i].mac)){
-                C->s[i].rssi=rssi; C->s[i].inact=ina;
-                dev_stats(C->s[i].ifc,&C->s[i].rx,&C->s[i].tx);
-                break;
-            }
-    };
-
-    while(fgets(l,sizeof l,p)){
-        if(sscanf(l,"Station %31s",mac)==1){ store(mac); /* commit prev */ rssi=-10000; ina=-1; }
-        else if(strstr(l,"signal"))        sscanf(l,"%*s %d",&rssi);
-        else if(strstr(l,"inactive time")) sscanf(l,"%*s %*s %ld",&ina);
-    }
-    store(mac);                /* commit last block */
-    pclose(p);
-
-    if(g_verbose)
-        for(int i=0;i<C->nsta;i++)
-            printf("[mst] %-15s mac=%s rssi=%d ina=%ld\n",
-                   C->s[i].ip,C->s[i].mac,C->s[i].rssi,C->s[i].inact);
-}
-// --------------------- rest of file unchanged -----------------
-
-
-/* ------------------------------------------------------------------ decision (master) */
-static void push_update(struct cfg *C, const char *via)
-{
-    for (int i = 0; i < C->nsta; i++) {
-        int s = socket(AF_INET, SOCK_STREAM, 0);
-        if (s < 0) continue;
-        struct timeval tv = { C->g.http_to, 0 };
-        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
-        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-
-        struct sockaddr_in sa = {0};
-        sa.sin_family = AF_INET;
-        sa.sin_port   = htons(C->g.http_port);
-        inet_aton(C->s[i].ip, &sa.sin_addr);
-
-        if (connect(s, (void *)&sa, sizeof sa) == 0) {
-            char body[128];
-            int bl = snprintf(body, sizeof body,
-                "{\"master_ip\":\"%s\",\"via\":\"%s\"}\n",
-                *C->master_ip ? C->master_ip : "192.168.0.1",
-                via);
-
-            char req[256];
-            int rl = snprintf(req, sizeof req,
-                "POST /update HTTP/1.0\r\n"
-                "Host: %s\r\n"
-                "Content-Length: %d\r\n\r\n%s",
-                C->s[i].ip, bl, body);
-
-            send(s, req, rl, 0);
-            recv(s, req, sizeof req, 0);
-        }
-        close(s);
-    }
-}
+/* ───────────────────────── decision engine ───────────────────────────── */
 static void decide(struct cfg *C)
 {
-    if (C->nsta == 0) { *C->via = 0; return; }
-
-    /* single STA shortcut */
-    if (C->nsta == 1) {
-        if (strcmp(C->via, C->s[0].ip)) {
-            strcpy(C->via, C->s[0].ip);
-            if (g_verbose) printf("[switch] via %s (single)\n", C->via);
-            push_update(C, C->via);
-        }
-        return;
-    }
-
-    int best = -10000;
+    /* suppress STA whose ping_fail exceeded limit */
     for (int i = 0; i < C->nsta; i++)
-        if (C->s[i].rssi > best) best = C->s[i].rssi;
+        if (C->s[i].ping_fail >= C->g.ping_fail_max)
+            C->s[i].rssi = -10000;
 
-    if (best <= -1000) {                      /* all links down */
-        if (*C->via) {
-            *C->via = 0;
-            if (g_verbose) puts("[switch] link lost");
-            push_update(C, "0.0.0.0");
-        }
+    /* floor guard */
+    int cur = -1;
+    for (int i = 0; i < C->nsta; i++)
+        if (*C->via && !strcmp(C->via, C->s[i].ip)) { cur = i; break; }
+    if (cur >= 0 && C->s[cur].rssi >= C->g.floor_db) return;
+
+    /* find best */
+    int best = -10000; char cand[64] = "";
+    for (int i = 0; i < C->nsta; i++)
+        if (C->s[i].rssi > best) { best = C->s[i].rssi; strcpy(cand, C->s[i].ip); }
+
+    if (best <= -1000) {                       /* none usable */
+        if (*C->via) { *C->via = 0; master_route(C, ""); }
         return;
     }
 
-    char cand[64] = "";
+    /* hysteresis window */
     for (int i = 0; i < C->nsta; i++)
         if (best - C->s[i].rssi < C->g.hyst_db)
             strncpy(cand, C->s[i].ip, 63);
@@ -279,16 +279,15 @@ static void decide(struct cfg *C)
     if (strcmp(cand, last)) {
         if (!t0) t0 = now;
         if (now - t0 >= C->g.hyst_ms) {
-            strcpy(last, cand);
-            strcpy(C->via, cand);
-            if (g_verbose) printf("[switch] via %s\n", cand);
-            push_update(C, cand);
+            strcpy(last, cand); strcpy(C->via, cand);
+            master_route(C, cand);
+            if (g_verbose) printf("[switch] via %s (rssi %d)\n", cand, best);
             t0 = 0;
         }
     } else t0 = 0;
 }
 
-/* ------------------------------------------------------------------ HTTP helpers */
+/* ───────────────────────── minimal HTTP API ──────────────────────────── */
 static int srv_init(int p)
 {
     int s = socket(AF_INET, SOCK_STREAM, 0);
@@ -296,70 +295,45 @@ static int srv_init(int p)
     struct sockaddr_in a = {0};
     a.sin_family = AF_INET; a.sin_port = htons(p);
     bind(s, (void *)&a, sizeof a); listen(s, 8);
-    fcntl(s, F_SETFL, O_NONBLOCK);
-    return s;
+    fcntl(s, F_SETFL, O_NONBLOCK); return s;
 }
 static void http_send(int fd, const char *typ, const char *b)
 {
     char h[128];
     int n = snprintf(h, sizeof h,
-        "HTTP/1.0 200 OK\r\n"
-        "Content-Type: %s\r\n"
-        "Content-Length: %zu\r\n\r\n",
+        "HTTP/1.0 200 OK\r\nContent-Type: %s\r\nContent-Length: %zu\r\n\r\n",
         typ, strlen(b));
-    send(fd, h, n, 0);
-    send(fd, b, strlen(b), 0);
+    send(fd, h, n, 0); send(fd, b, strlen(b), 0);
 }
-static void json_status(struct cfg *C, char *buf)
+static void json_status(struct cfg *C, char *out)
 {
     int n = 0;
-    n += sprintf(buf + n, "{\"role\":\"%s\",\"active\":\"%s\"",
-                 C->g.role, *C->via ? C->via : "none");
+    n += sprintf(out + n,
+                 "{\"role\":\"master\",\"active\":\"%s\",\"nodes\":[",
+                 *C->via ? C->via : "none");
 
-    if (!strcmp(C->g.role, "sta") && C->nsta)
-        n += sprintf(buf + n,
-                     ",\"rssi\":%d,\"inactive_ms\":%ld",
-                     C->s[0].rssi, C->s[0].inact);
-
-    if (!strcmp(C->g.role, "master")) {
-        n += sprintf(buf + n, ",\"nodes\":[");
-        for (int i = 0; i < C->nsta; i++)
-            n += sprintf(buf + n,
-                "%s{\"ip\":\"%s\",\"rssi\":%d}",
-                i ? "," : "", C->s[i].ip, C->s[i].rssi);
-        n += sprintf(buf + n, "]");
-    }
-    sprintf(buf + n, "}\n");
-}
-
-/* BusyBox‑compatible neighbour flush */
-static void sta_route(struct cfg *C, const char *via)
-{
-    int ok = 0;
     for (int i = 0; i < C->nsta; i++)
-        if (!strcmp(via, C->s[i].ip)) { ok = 1; break; }
-    if (!ok) { if (g_verbose) puts("[sta] invalid via"); return; }
+        n += sprintf(out + n,
+            "%s{\"ip\":\"%s\",\"rssi\":%d,\"fail\":%d}",
+            i ? "," : "", C->s[i].ip, C->s[i].rssi, C->s[i].ping_fail);
 
-    char cmd[128];
-    snprintf(cmd, sizeof cmd,
-             "ip route replace %s/32 via %s", C->master_ip, via);
-    system(cmd);
-
-    snprintf(cmd, sizeof cmd,
-             "ip neigh del %s dev %s"
-             " || ip -4 neigh flush to %s dev %s",
-             C->master_ip, C->s[0].ifc,
-             C->master_ip, C->s[0].ifc);
-    system(cmd);
-
-    if (g_verbose) printf("[sta] route -> %s\n", via);
+    sprintf(out + n, "]}\n");
 }
+
 
 static void handle(int fd, struct cfg *C)
 {
-    char req[BUF_SZ]; int r = recv(fd, req, sizeof req - 1, 0);
-    if (r <= 0) { close(fd); return; } req[r] = 0;
-    if (g_verbose) printf("[http] %.40s\n", req);
+    char req[BUF_SZ];
+    int r = 0, n;
+    while ((n = recv(fd, req + r, sizeof req - 1 - r, 0)) > 0) {
+        r += n;
+        if (memchr(req, '\n', r)) break;          /* got first line */
+    }
+    if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) { close(fd); return; }
+    if (r == 0) { close(fd); return; }            /* nothing read */
+    req[r] = 0;
+
+
 
     if (!strncmp(req, "GET /status", 11)) {
         char body[BUF_SZ]; json_status(C, body);
@@ -369,36 +343,20 @@ static void handle(int fd, struct cfg *C)
         int f = open(C->g.html, O_RDONLY);
         if (f >= 0) {
             struct stat st; fstat(f, &st);
-            char hdr[128]; int n = sprintf(hdr,
-                "HTTP/1.0 200 OK\r\n"
-                "Content-Length: %zu\r\n"
+            char hdr[128]; int n = snprintf(hdr, sizeof hdr,
+                "HTTP/1.0 200 OK\r\nContent-Length: %zu\r\n"
                 "Content-Type: text/html\r\n\r\n", st.st_size);
             send(fd, hdr, n, 0);
             while ((r = read(f, req, sizeof req)) > 0) send(fd, req, r, 0);
             close(f);
         } else http_send(fd, "text/plain", "404\n");
 
-    } else if (!strncmp(req, "POST /update", 12) &&
-               !strcmp(C->g.role, "sta")) {
-        char *p = strstr(req, "\"via\":\"");
-        if (p) {
-            p += 7; char *e = strchr(p, '"');
-            if (e && e - p < 64) {
-                char ip[64]; memcpy(ip, p, e - p); ip[e - p] = 0;
-                sta_route(C, ip);
-                http_send(fd, "application/json", "{\"status\":\"ok\"}\n");
-                close(fd); return;
-            }
-        }
-        http_send(fd, "application/json", "{\"status\":\"error\"}\n");
+    } else http_send(fd, "text/plain", "404\n");
 
-    } else {
-        http_send(fd, "text/plain", "404\n");
-    }
     close(fd);
 }
 
-/* ------------------------------------------------------------------ main */
+/* ───────────────────────── main loop ─────────────────────────────────── */
 int main(int argc, char **argv)
 {
     const char *cfgf = CFG_DEF;
@@ -407,28 +365,25 @@ int main(int argc, char **argv)
         else cfgf = argv[i];
 
     struct cfg C = {0};
-    /* defaults */
-    strcpy(C.g.role,"sta");
-    C.g.poll_ms   = 500;
-    C.g.hyst_ms   = 2000;
-    C.g.hyst_db   = 20;
-    C.g.http_port = 8080;
-    C.g.http_to   = 1;
+    /* sensible defaults */
+    C.g.poll_ms       = 500;
+    C.g.hyst_ms       = 2000;
+    C.g.hyst_db       = 20;
+    C.g.floor_db      = -40;
+    C.g.http_port     = 8080;
+    C.g.ping_to_ms    = 700;
+    C.g.ping_fail_max = 3;
+    strcpy(C.g.master_if, "wlan0");
     strcpy(C.g.html, "/etc/linkmgrd.html");
 
     if (ini_load(cfgf, &C) < 0) return 1;
 
-    if (g_verbose) {
-        printf("[init] role=%s nsta=%d poll=%dms hyst=%ddB/%dms\n",
-               C.g.role, C.nsta, C.g.poll_ms,
-               C.g.hyst_db, C.g.hyst_ms);
-        if (!strcmp(C.g.role, "master"))
-            printf("[init] master STAs: %s iface=%s\n",
-                   C.csv, C.g.master_if);
-    }
+    if (g_verbose)
+        printf("[init] nsta=%d poll=%dms ping_to=%dms fail_max=%d iface=%s\n",
+               C.nsta, C.g.poll_ms, C.g.ping_to_ms, C.g.ping_fail_max,
+               C.g.master_if);
 
-    signal(SIGINT, sig_hdl);
-    signal(SIGTERM, sig_hdl);
+    signal(SIGINT, sig_hdl); signal(SIGTERM, sig_hdl);
 
     int srv = srv_init(C.g.http_port);
     long next_poll = ms_now() + C.g.poll_ms;
@@ -436,27 +391,33 @@ int main(int argc, char **argv)
 
     while (g_run) {
         long now = ms_now();
-        long to  = 500;
+        long to = 500;
         if (now < next_poll && next_poll - now < to) to = next_poll - now;
-        if (!strcmp(C.g.role,"master") &&
-            now < next_dec && next_dec - now < to)  to = next_dec - now;
+        if (now < next_dec  && next_dec  - now < to) to = next_dec  - now;
 
         struct timeval tv = { to / 1000, (to % 1000) * 1000 };
         fd_set rset; FD_ZERO(&rset); FD_SET(srv, &rset);
         if (select(srv + 1, &rset, NULL, NULL, &tv) > 0 &&
             FD_ISSET(srv, &rset)) {
             int c = accept(srv, NULL, NULL);
-            if (c >= 0) { fcntl(c, F_SETFL, O_NONBLOCK); handle(c, &C); }
+            if (c >= 0) {
+                int flags = fcntl(c, F_GETFL, 0);          /* ← NEW */
+                fcntl(c, F_SETFL, flags & ~O_NONBLOCK);    /* ← NEW */
+
+    handle(c, &C);
+}
         }
 
         now = ms_now();
         if (now >= next_poll) {
-            if (!strcmp(C.g.role, "master")) mst_poll(&C);
-            else                             sta_poll(&C);
+            rssi_poll(&C);
+            ping_poll(&C);
+            route_watchdog(&C);          /* keep table sane */
             next_poll = now + C.g.poll_ms;
         }
-        if (!strcmp(C.g.role, "master") && now >= next_dec) {
-            decide(&C); next_dec = now + C.g.hyst_ms;
+        if (now >= next_dec) {
+            decide(&C);
+            next_dec  = now + C.g.hyst_ms;
         }
     }
     close(srv);
