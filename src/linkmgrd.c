@@ -313,7 +313,7 @@ static void decide(struct cfg *C)
             if (g_verbose) printf("[switch] via %s (rssi %d)\n", cand, best);
             t0 = 0;
         }
-    } else t0 = 0;
+    }
 }
 
 /* ───────────────────────── minimal HTTP API ──────────────────────────── */
@@ -409,6 +409,9 @@ int main(int argc, char **argv)
     strcpy(C.g.html, "/etc/linkmgrd.html");
 
     if (ini_load(cfgf, &C) < 0) return 1;
+
+        if (setvbuf(stdout, NULL, _IOLBF, 0) != 0)
+        perror("setvbuf");
 
     if (g_verbose)
         printf("[init] nsta=%d poll=%dms ping_to=%dms fail_max=%d iface=%s\n",
