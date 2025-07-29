@@ -196,8 +196,11 @@ static int ping_alive(const char *ip, int timeout_ms)
                      (struct sockaddr *)&sfrom, &sl) >= (ssize_t)sizeof(struct ip))
         {
             struct icmphdr *rh = (struct icmphdr *)(buf + sizeof(struct ip));
+
+            /* accept *only* a genuine Echo‑Reply from the target IP */
             if (rh->type == ICMP_ECHOREPLY &&
-                rh->un.echo.id == h->un.echo.id)
+                rh->un.echo.id == h->un.echo.id &&
+                sfrom.sin_addr.s_addr == dst.sin_addr.s_addr)
                 ok = 1;
         }
     }
@@ -206,17 +209,30 @@ static int ping_alive(const char *ip, int timeout_ms)
 }
 static void ping_poll(struct cfg *C)
 {
+    /* remembers consecutive successes per STA */
+    static uint8_t ok_streak[MAX_STA] = {0};
+
     for (int i = 0; i < C->nsta; i++) {
-        /* ── probe ─────────────────────────────────────────────────── */
         int alive = ping_alive(C->s[i].ip, C->g.ping_to_ms);
 
-        if (alive) C->s[i].ping_fail = 0;
-        else if (C->s[i].ping_fail < 255)
-            C->s[i].ping_fail++;
+        if (alive) {
+            if (ok_streak[i] < 255) ok_streak[i]++;
 
-        /* ── console output (verbose) ──────────────────────────────── */
+            /* clear fault after ping_fail_max consecutive OKs */
+            if (ok_streak[i] >= C->g.ping_fail_max) {
+                C->s[i].ping_fail = 0;
+            } else if (C->s[i].ping_fail > 0) {
+                C->s[i].ping_fail--;             /* gentle decay */
+            }
+        } else {                                 /* timeout */
+            ok_streak[i] = 0;                    /* break streak */
+            if (C->s[i].ping_fail < 255)
+                C->s[i].ping_fail++;
+        }
+
+        /* verbose console line uses masked RSSI */
         if (g_verbose) {
-            int er = EFFECTIVE_RSSI(C->s[i], *C);   /* masked RSSI */
+            int er = EFFECTIVE_RSSI(C->s[i], *C);
             printf("[ping] %s %s  rssi=%d  fail=%d\n",
                    C->s[i].ip,
                    alive ? "OK" : "timeout",
@@ -225,6 +241,7 @@ static void ping_poll(struct cfg *C)
         }
     }
 }
+
 
 
 /* ───────────────────────── route helpers ─────────────────────────────── */
