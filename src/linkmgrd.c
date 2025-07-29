@@ -244,24 +244,28 @@ static void ping_poll(struct cfg *C)
 
 
 
+
 /* ───────── replace default route on the master ───────── */
 static void master_route(struct cfg *C, const char *gw)
 {
     char cmd[256];
 
     if (*gw) {
-        /* atomically overwrite any existing default */
+        /* overwrite default and ensure the neighbour cache is fresh */
         snprintf(cmd, sizeof cmd,
-                 "ip route replace default via %s dev %s metric 0",
+                 "ip route replace default via %s dev %s metric 0 && "
+                 "ip neigh flush all",
                  gw, C->g.master_if);
     } else {
-        /* no usable link: remove the WLAN default */
+        /* remove the WLAN default (link lost) */
         snprintf(cmd, sizeof cmd,
                  "ip route del default dev %s 2>/dev/null",
                  C->g.master_if);
     }
     system(cmd);
 }
+
+
 static int route_is_ok(struct cfg *C, const char *gw)
 {
     FILE *p = popen("ip route show default", "r");
