@@ -285,19 +285,37 @@ static bool load_info_buffer(void)
     FILE *fp = fopen(cfg.info_file, "r");
     if (!fp) return false;
 
-    fseek(fp, 0, SEEK_END);
-    long sz = ftell(fp);
-    rewind(fp);
-
     free(info_buf);
-    info_buf = malloc(sz + 1);
-    if (!info_buf) { fclose(fp); return false; }
+    info_buf     = NULL;
+    info_size    = 0;
 
-    size_t got = fread(info_buf, 1, sz, fp);
+    size_t cap   = 0;
+    char  tmp[256];
+    while (fgets(tmp, sizeof(tmp), fp)) {
+        size_t len = strlen(tmp);
+        if (info_size + len + 1 > cap) {
+            cap = (cap + len + 1) * 2;
+            char *newbuf = realloc(info_buf, cap);
+            if (!newbuf) {
+                free(info_buf);
+                fclose(fp);
+                return false;
+            }
+            info_buf = newbuf;
+        }
+        memcpy(info_buf + info_size, tmp, len);
+        info_size += len;
+    }
+
+    if (info_buf)
+        info_buf[info_size] = '\0';
+    else {
+        // empty file
+        info_buf = strdup("");
+        info_size = 0;
+    }
+
     fclose(fp);
-
-    info_buf[got] = '\0';
-    info_size    = got;
     return true;
 }
 
