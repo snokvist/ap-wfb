@@ -42,6 +42,7 @@
 #define MAX_CMDS          64
 #define MAX_VALS          32
 #define CMD_MAXLEN        256
+#define VALUE_BUF         1024
 
 #define MAX_EVENTS        64
 #define MAX_FDS           65536
@@ -279,7 +280,9 @@ static void handle_request(int cfd)
                 "HTTP/1.0 500 Internal\r\n\r\nExec failed\n", 41);
             return;
         }
-        char out[128] = {0}; fgets(out, sizeof(out) - 1, p); pclose(p);
+       /* allow up to 4 KiB of output */
+       char out[VALUE_BUF] = {0};
+       fgets(out, VALUE_BUF - 1, p);
         size_t L = strlen(out);
         while (L && (out[L - 1] == '\n' || out[L - 1] == '\r')) out[--L] = 0;
 
