@@ -1,6 +1,12 @@
-/* linkmgrd.c — master-only fail-over daemon
- * -----------------------------------------
+/* linkmgrd.c — master-only fail-over daemon (INI-file RSSI polling)
+ * ---------------------------------------------------------------
  * Build:  gcc -O2 -Wall -o linkmgrd linkmgrd.c
+ *
+ * 2025-08-02  —  RSSI is no longer parsed from `iw dev …`.
+ *               - Each STA section must provide an `rssi_key`.
+ *               - Global `[general]` option `sta_poll_file`
+ *                 points to a simple key=value file that is
+ *                 refreshed by an external process.
  */
 
 #define _GNU_SOURCE
@@ -42,18 +48,20 @@ struct gcfg {
     int  ping_succ_min;
     char html[PATH_MAX];
     char master_if[32];
+    char sta_poll_file[PATH_MAX];   /* ← new: external RSSI source */
 };
 struct sta {
-    char ip[64], mac[32];
+    char ip[64];
+    char rssi_key[32];              /* ← new */
     int  rssi;
-    uint8_t fail;    /* consecutive time-outs          */
-    uint8_t succ;    /* consecutive successes          */
+    uint8_t fail;                   /* consecutive ping time-outs */
+    uint8_t succ;                   /* consecutive successes      */
 };
 struct cfg {
     struct gcfg g;
     int  nsta;
     struct sta s[MAX_STA];
-    char via[64];                    /* current default gateway IP        */
+    char via[64];                   /* current default gateway IP */
 };
 
 /* ───────────────────────── helpers ───────────────────────────────────── */
@@ -97,12 +105,15 @@ static int ini_load(const char *fn, struct cfg *C)
             else if (!strcmp(k, "html_path"))          strncpy(C->g.html, v, PATH_MAX - 1);
             else if (!strcmp(k, "ping_succ_min"))      C->g.ping_succ_min = atoi(v);
             else if (!strcmp(k, "master_iface"))       strncpy(C->g.master_if, v, 31);
+            else if (!strcmp(k, "sta_poll_file"))      strncpy(C->g.sta_poll_file, v, PATH_MAX - 1);
 
         } else if (!strncmp(sec, "sta", 3)) {
             int i = C->nsta; if (i >= MAX_STA) continue;
-            if      (!strcmp(k, "ip"))  strncpy(C->s[i].ip,  v, 63);
-            else if (!strcmp(k, "mac")) strncpy(C->s[i].mac, v, 31);
-            if (*C->s[i].ip && *C->s[i].mac) C->nsta = i + 1;
+
+            if      (!strcmp(k, "ip"))        strncpy(C->s[i].ip, v, 63);
+            else if (!strcmp(k, "rssi_key"))  strncpy(C->s[i].rssi_key, v, 31);
+
+            if (*C->s[i].ip && *C->s[i].rssi_key) C->nsta = i + 1;
         }
     }
     fclose(f);
@@ -110,61 +121,42 @@ static int ini_load(const char *fn, struct cfg *C)
     return 0;
 }
 
-/* ───────────────────────── RSSI polling via iw ───────────────────────── */
-static void rssi_poll(struct cfg *C)
+/* ───────────────── RSSI polling from external INI file ──────────────── */
+static void rssi_poll_from_file(struct cfg *C)
 {
-    char cmd[128];
-    snprintf(cmd, sizeof cmd, "iw dev %s station dump", C->g.master_if);
+    if (!*C->g.sta_poll_file) return;
 
-    int fds[2]; pid_t pid;
-    if (pipe(fds) || (pid = fork()) < 0) { perror("pipe/fork"); return; }
+    int fd = open(C->g.sta_poll_file, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return;
 
-    if (pid == 0) {                       /* child */
-        close(fds[0]); dup2(fds[1], STDOUT_FILENO); close(fds[1]);
-        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL); _exit(127);
-    }
-    close(fds[1]);
+    char buf[2048];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return;
+    buf[n] = '\0';
 
-    FILE *p = fdopen(fds[0], "r");
-    if (!p) { close(fds[0]); return; }
-
+    /* default everything to “no signal” */
     for (int i = 0; i < C->nsta; i++) C->s[i].rssi = -10000;
 
-    char l[LN_SZ], mac[32] = ""; int rssi = -10000;
-
-    auto void commit(const char *m)
-    {
-        if (!*m) return;
-        for (int i = 0; i < C->nsta; i++)
-            if (!strcasecmp(m, C->s[i].mac)) { C->s[i].rssi = rssi; break; }
-    }
-
-    struct timespec ts0; clock_gettime(CLOCK_MONOTONIC, &ts0);
-    int lc = 0;
-    while (fgets(l, sizeof l, p)) {
-        if ((++lc & 15) == 0) {
-            struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-            long ms = (ts.tv_sec - ts0.tv_sec) * 1000L +
-                      (ts.tv_nsec - ts0.tv_nsec) / 1000000L;
-            if (ms > 300) break;
+    char *line = strtok(buf, "\n");
+    while (line) {
+        trim(line);
+        char key[32]; int val;
+        if (sscanf(line, "%31[^=]=%d", key, &val) == 2) {
+            for (int i = 0; i < C->nsta; i++)
+                if (!strcmp(key, C->s[i].rssi_key))
+                    C->s[i].rssi = val;
         }
-        char new_mac[32];
-        if (sscanf(l, "Station %31s", new_mac) == 1) {
-            commit(mac); strcpy(mac, new_mac); rssi = -10000; continue;
-        }
-        if (strstr(l, "signal")) sscanf(l, "%*s %d", &rssi);
+        line = strtok(NULL, "\n");
     }
-    commit(mac);
-
-    fclose(p); kill(pid, SIGKILL); waitpid(pid, NULL, 0);
 }
 
-/* ───────────────────────── tiny raw-socket ICMP ping ──────────────────── */
+/* ───────────────────────── tiny raw-socket ICMP ping ─────────────────── */
 static uint16_t csum16(const void *v, size_t len)
 {
     const uint16_t *p = v; uint32_t sum = 0;
     while (len > 1) { sum += *p++; len -= 2; }
-    if (len) sum += *(uint8_t *)p;
+    if (len) sum += *(const uint8_t *)p;
     sum = (sum >> 16) + (sum & 0xffff);
     sum += (sum >> 16);
     return (uint16_t)~sum;
@@ -199,8 +191,6 @@ static int ping_alive(const char *ip, int timeout_ms)
                      (struct sockaddr *)&sfrom, &sl) >= (ssize_t)sizeof(struct ip))
         {
             struct icmphdr *rh = (struct icmphdr *)(buf + sizeof(struct ip));
-
-            /* accept *only* a genuine Echo‑Reply from the target IP */
             if (rh->type == ICMP_ECHOREPLY &&
                 rh->un.echo.id == h->un.echo.id &&
                 sfrom.sin_addr.s_addr == dst.sin_addr.s_addr)
@@ -214,15 +204,14 @@ static void ping_poll(struct cfg *C)
 {
     for (int i = 0; i < C->nsta; i++) {
         struct sta *s = &C->s[i];
-
         int alive = ping_alive(s->ip, C->g.ping_to_ms);
 
         if (alive) {
             s->succ++;
-            if (s->fail) s->fail = 0;               /* clear fail streak   */
+            if (s->fail) s->fail = 0;
         } else {
             s->fail++;
-            s->succ = 0;                            /* break success streak*/
+            s->succ = 0;
         }
         if (s->fail > 255) s->fail = 255;
         if (s->succ > 255) s->succ = 255;
@@ -236,30 +225,23 @@ static void ping_poll(struct cfg *C)
     }
 }
 
-
-
-
 /* ───────── replace default route on the master ───────── */
 static void master_route(struct cfg *C, const char *gw)
 {
     char cmd[256];
 
     if (*gw) {
-        /* overwrite default and ensure the neighbour cache is fresh */
         snprintf(cmd, sizeof cmd,
                  "ip route replace default via %s dev %s metric 0 && "
                  "ip neigh flush all",
                  gw, C->g.master_if);
     } else {
-        /* remove the WLAN default (link lost) */
         snprintf(cmd, sizeof cmd,
                  "ip route del default dev %s 2>/dev/null",
                  C->g.master_if);
     }
     system(cmd);
 }
-
-
 static int route_is_ok(struct cfg *C, const char *gw)
 {
     FILE *p = popen("ip route show default", "r");
@@ -280,7 +262,6 @@ static void route_watchdog(struct cfg *C)
 /* ───────────────────────── decision engine ───────────────────────────── */
 static void decide(struct cfg *C)
 {
-
     static char last[64] = "";
     static long t0 = 0;
 
@@ -297,37 +278,26 @@ static void decide(struct cfg *C)
         int er = EFFECTIVE_RSSI(C->s[i], *C);
         if (er > best) { best = er; strcpy(best_ip, C->s[i].ip); }
     }
-    /* -------------------------------------------------------------- */
-    /*  no *usable* link?  → keep the STA with the strongest raw RSSI  */
-    /* -------------------------------------------------------------- */
-    if (best <= -1000) {                 /* every link currently masked */
 
-        /* pick the STA whose raw RSSI (un‑masked) is highest */
-        int best_raw  = -10000;
-        int best_idx  = -1;
+    /* no usable link? keep the strongest raw RSSI */
+    if (best <= -1000) {
+        int best_raw = -10000, best_idx = -1;
         for (int i = 0; i < C->nsta; i++)
             if (C->s[i].rssi > best_raw) {
                 best_raw = C->s[i].rssi;
                 best_idx = i;
             }
 
-        /* fall back to that STA, even though it’s “bad” */
-        if (best_idx >= 0 &&
-            strcmp(C->via, C->s[best_idx].ip)) {
-
+        if (best_idx >= 0 && strcmp(C->via, C->s[best_idx].ip)) {
             strcpy(C->via, C->s[best_idx].ip);
             master_route(C, C->via);
             if (g_verbose)
                 printf("[force] keeping worst link via %s (raw rssi %d)\n",
                        C->via, best_raw);
         }
-
-        /* reset hysteresis so a real good link can switch in quickly */
-        last[0] = '\0';
-        t0      = 0;
+        last[0] = '\0'; t0 = 0;
         return;
     }
-
 
     /* hysteresis window */
     char cand[64] = "";
@@ -341,7 +311,6 @@ static void decide(struct cfg *C)
         if (!t0) t0 = now;
         if (now - t0 >= C->g.hyst_ms) {
             strcpy(last, cand); strcpy(C->via, cand);
-            /* clear counters on the chosen link */
             for (int i = 0; i < C->nsta; i++)
                 if (!strcmp(cand, C->s[i].ip))
                     C->s[i].fail = C->s[i].succ = 0;
@@ -383,26 +352,22 @@ static void json_status(struct cfg *C, char *out)
             i ? "," : "",
             C->s[i].ip,
             EFFECTIVE_RSSI(C->s[i], *C),
-            C->s[i].fail,              /* time‑outs in a row   */
-            C->s[i].succ);             /* successes in a row   */
+            C->s[i].fail,
+            C->s[i].succ);
 
     sprintf(out + n, "]}\n");
 }
-
-
 static void handle(int fd, struct cfg *C)
 {
     char req[BUF_SZ];
     int r = 0, n;
     while ((n = recv(fd, req + r, sizeof req - 1 - r, 0)) > 0) {
         r += n;
-        if (memchr(req, '\n', r)) break;          /* got first line */
+        if (memchr(req, '\n', r)) break;
     }
     if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) { close(fd); return; }
-    if (r == 0) { close(fd); return; }            /* nothing read */
+    if (r == 0) { close(fd); return; }
     req[r] = 0;
-
-
 
     if (!strncmp(req, "GET /status", 11)) {
         char body[BUF_SZ]; json_status(C, body);
@@ -419,7 +384,6 @@ static void handle(int fd, struct cfg *C)
             while ((r = read(f, req, sizeof req)) > 0) send(fd, req, r, 0);
             close(f);
         } else http_send(fd, "text/plain", "404\n");
-
     } else http_send(fd, "text/plain", "404\n");
 
     close(fd);
@@ -445,16 +409,18 @@ int main(int argc, char **argv)
     C.g.ping_succ_min = 2;
     strcpy(C.g.master_if, "wlan0");
     strcpy(C.g.html, "/etc/linkmgrd.html");
+    /* default RSSI file can be empty; user may override */
+    C.g.sta_poll_file[0] = '\0';
 
     if (ini_load(cfgf, &C) < 0) return 1;
 
-        if (setvbuf(stdout, NULL, _IOLBF, 0) != 0)
-        perror("setvbuf");
+    if (setvbuf(stdout, NULL, _IOLBF, 0) != 0) perror("setvbuf");
 
     if (g_verbose)
-        printf("[init] nsta=%d poll=%dms ping_to=%dms fail_max=%d iface=%s\n",
+        printf("[init] nsta=%d poll=%dms ping_to=%dms fail_max=%d iface=%s file=%s\n",
                C.nsta, C.g.poll_ms, C.g.ping_to_ms, C.g.ping_fail_max,
-               C.g.master_if);
+               C.g.master_if,
+               *C.g.sta_poll_file ? C.g.sta_poll_file : "(none)");
 
     signal(SIGINT, sig_hdl); signal(SIGTERM, sig_hdl);
 
@@ -474,18 +440,17 @@ int main(int argc, char **argv)
             FD_ISSET(srv, &rset)) {
             int c = accept(srv, NULL, NULL);
             if (c >= 0) {
-                int flags = fcntl(c, F_GETFL, 0);          /* ← NEW */
-                fcntl(c, F_SETFL, flags & ~O_NONBLOCK);    /* ← NEW */
-
-    handle(c, &C);
-}
+                int flags = fcntl(c, F_GETFL, 0);
+                fcntl(c, F_SETFL, flags & ~O_NONBLOCK);
+                handle(c, &C);
+            }
         }
 
         now = ms_now();
         if (now >= next_poll) {
-            rssi_poll(&C);
+            rssi_poll_from_file(&C);   /* ← new polling */
             ping_poll(&C);
-            route_watchdog(&C);          /* keep table sane */
+            route_watchdog(&C);
             next_poll = now + C.g.poll_ms;
         }
         if (now >= next_dec) {
