@@ -42,7 +42,7 @@
 #define MAX_CMDS          64
 #define MAX_VALS          32
 #define CMD_MAXLEN        256
-#define VALUE_BUF         1024
+#define VALUE_BUF         2048
 
 #define MAX_EVENTS        64
 #define MAX_FDS           65536
