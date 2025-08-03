@@ -83,7 +83,10 @@ static void parse_proc(const char *path,char macs[][MAC_LEN],int n,StaStats st[]
 
         /* ------------ RX info ------------ */
         if(cur==-1){
-            if(strstr(line,"rssi_min"))            rx->rssi_min     = first_int(line);
+            if (strstr(line,"rssi_min")) {
+                char *p = strstr(line,"rssi_min");
+                if (p) rx->rssi_min = first_int(p);   /* skip past token first */
+            }
             else if(strstr(line,"cnt_cck_fail")){  rx->cnt_cck_fail = first_int(line);
                 char *p=strstr(line,"cnt_ofdm_fail"); if(p)rx->cnt_ofdm_fail=first_int(p);
                 p=strstr(line,"Total False Alarm"); if(p)rx->false_alarm   =first_int(p);
