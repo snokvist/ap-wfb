@@ -23,6 +23,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <glob.h>
 
 /* ----------------------------- defaults --------------------------------- */
 static int last_valid_rssi      = 0;
@@ -190,6 +191,29 @@ static void set_cfg_field(const char *k,const char *v)
 #undef EQ
 }
 
+
+
+/* ---------------------------------------------------- */
+/* helper that expands wildcards and opens the first hit */
+static FILE *fopen_glob_first(const char *pattern, const char *mode)
+{
+    /* fast path: no meta-chars → normal fopen */
+    if (!strpbrk(pattern, "*?["))        /* nothing to expand */
+        return fopen(pattern, mode);
+
+    glob_t g;
+    if (glob(pattern, GLOB_NOSORT, NULL, &g) != 0 || g.gl_pathc == 0) {
+        globfree(&g);
+        return NULL;                     /* no match */
+    }
+
+    FILE *fp = fopen(g.gl_pathv[0], mode);  /* first match is fine */
+    globfree(&g);
+    return fp;
+}
+
+
+
 static void load_config(const char *path)
 {
     FILE *fp = fopen(path,"r");
@@ -282,7 +306,7 @@ static int get_display_rssi(int raw)
  */
 static bool load_info_buffer(void)
 {
-    FILE *fp = fopen(cfg.info_file, "r");
+    FILE *fp = fopen_glob_first(cfg.info_file, "r");
     if (!fp) return false;
 
     free(info_buf);
@@ -318,6 +342,7 @@ static bool load_info_buffer(void)
     fclose(fp);
     return true;
 }
+
 
 
 
@@ -437,7 +462,7 @@ static int send_icmp_echo(int s,struct sockaddr_in *dst,uint16_t seq){
 
 static int read_rssi(const char *path)
 {
-    FILE *fp = fopen(path, "r");
+    FILE *fp = fopen_glob_first(path, "r");
     if (!fp) return -1;
 
     char *line = NULL;
