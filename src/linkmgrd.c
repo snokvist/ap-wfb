@@ -52,17 +52,26 @@ struct gcfg {
 };
 struct sta {
     char ip[64];
-    char rssi_key[32];              /* ← new */
+    char rssi_key[32];
     int  rssi;
-    uint8_t fail;                   /* consecutive ping time-outs */
-    uint8_t succ;                   /* consecutive successes      */
+    int  retry;            /* NEW */
+    uint8_t fail, succ;
 };
 struct cfg {
     struct gcfg g;
     int  nsta;
     struct sta s[MAX_STA];
-    char via[64];                   /* current default gateway IP */
+
+    /* NEW runtime-only radio stats */
+    int txpwr;                    /* dBm or driver unit */
+    int cck_fail, ofdm_fail, fa;  /* false-alarm counters */
+
+    char via[64];
 };
+
+
+
+
 
 /* ───────────────────────── helpers ───────────────────────────────────── */
 static long ms_now(void)
@@ -129,25 +138,42 @@ static void rssi_poll_from_file(struct cfg *C)
     int fd = open(C->g.sta_poll_file, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return;
 
-    char buf[2048];
+    char buf[4096];
     ssize_t n = read(fd, buf, sizeof(buf) - 1);
     close(fd);
     if (n <= 0) return;
     buf[n] = '\0';
 
-    /* default everything to “no signal” */
-    for (int i = 0; i < C->nsta; i++) C->s[i].rssi = -10000;
+    /* reset per-poll defaults */
+    for (int i = 0; i < C->nsta; i++) {
+        C->s[i].rssi  = -10000;
+        C->s[i].retry = -1;
+    }
+    C->txpwr = C->cck_fail = C->ofdm_fail = C->fa = -1;
 
-    char *line = strtok(buf, "\n");
-    while (line) {
-        trim(line);
-        char key[32]; int val;
-        if (sscanf(line, "%31[^=]=%d", key, &val) == 2) {
-            for (int i = 0; i < C->nsta; i++)
-                if (!strcmp(key, C->s[i].rssi_key))
-                    C->s[i].rssi = val;
+    /* parse key=value lines */
+    char *ln = strtok(buf, "\n");
+    while (ln) {
+        trim(ln);
+
+        char key[64]; int val;
+        if (sscanf(ln, "%63[^=]=%d", key, &val) == 1 + 1) {
+
+            /* staX_rssi / staX_retry */
+            if (!strncmp(key, "sta", 3) && (key[4] == '_' || key[5] == '_')) {
+                int id = atoi(key + 3);          /* sta0_rssi → 0 */
+                if (id >= 0 && id < C->nsta) {
+                    if (strstr(key, "_rssi"))  C->s[id].rssi  = val;
+                    if (strstr(key, "_retry")) C->s[id].retry = val;
+                }
+            }
+            /* module-wide counters */
+            else if (!strcmp(key, "txpwr"))                    C->txpwr     = val;
+            else if (!strcmp(key, "rxinfo_cnt_cck_fail"))      C->cck_fail  = val;
+            else if (!strcmp(key, "rxinfo_cnt_ofdm_fail"))     C->ofdm_fail = val;
+            else if (!strcmp(key, "rxinfo_false_alarm"))       C->fa        = val;
         }
-        line = strtok(NULL, "\n");
+        ln = strtok(NULL, "\n");
     }
 }
 
@@ -351,14 +377,19 @@ static void json_status(struct cfg *C, char *out)
 
     for (int i = 0; i < C->nsta; i++)
         n += sprintf(out + n,
-            "%s{\"ip\":\"%s\",\"rssi\":%d,\"fail\":%d,\"succ\":%d}",
+            "%s{\"ip\":\"%s\",\"rssi\":%d,\"retry\":%d,"
+            "\"fail\":%d,\"succ\":%d}",
             i ? "," : "",
             C->s[i].ip,
             EFFECTIVE_RSSI(C->s[i], *C),
+            C->s[i].retry,
             C->s[i].fail,
             C->s[i].succ);
 
-    sprintf(out + n, "]}\n");
+    sprintf(out + n,
+        "],\"txpwr\":%d,\"cck_fail\":%d,"
+        "\"ofdm_fail\":%d,\"false_alarm\":%d}\n",
+        C->txpwr, C->cck_fail, C->ofdm_fail, C->fa);
 }
 /* ───────────────────────── HTTP request handler ──────────────────────── */
 static void handle(int fd, struct cfg *C)
@@ -424,6 +455,10 @@ int main(int argc, char **argv)
     C.g.ping_to_ms    = 700;
     C.g.ping_fail_max = 3;
     C.g.ping_succ_min = 2;
+    C.txpwr      = -1;
+    C.cck_fail   = C.ofdm_fail = C.fa = -1;
+    for (int i = 0; i < MAX_STA; i++) C.s[i].retry = -1;
+
     strcpy(C.g.master_if, "wlan0");
     strcpy(C.g.html, "/etc/linkmgrd.html");
     /* default RSSI file can be empty; user may override */
