@@ -202,17 +202,20 @@ static int ping_alive(const char *ip, int timeout_ms)
 }
 static void ping_poll(struct cfg *C)
 {
+    if (C->nsta == 0) return;                /* nothing to do */
+
+    long t_start = ms_now();
+
     for (int i = 0; i < C->nsta; i++) {
+        /* hard cap: never spend more than 1 s inside ping_poll() */
+        if (ms_now() - t_start > 1000) break;
+
         struct sta *s = &C->s[i];
         int alive = ping_alive(s->ip, C->g.ping_to_ms);
 
-        if (alive) {
-            s->succ++;
-            if (s->fail) s->fail = 0;
-        } else {
-            s->fail++;
-            s->succ = 0;
-        }
+        if (alive) { s->succ++; s->fail = 0; }
+        else       { s->fail++; s->succ = 0; }
+
         if (s->fail > 255) s->fail = 255;
         if (s->succ > 255) s->succ = 255;
 
@@ -357,34 +360,48 @@ static void json_status(struct cfg *C, char *out)
 
     sprintf(out + n, "]}\n");
 }
+/* ───────────────────────── HTTP request handler ──────────────────────── */
 static void handle(int fd, struct cfg *C)
 {
     char req[BUF_SZ];
-    int r = 0, n;
+    int  r = 0, n;
+
+    /* read up to (first-line + \n) or until the 1-second SO_RCVTIMEO fires */
     while ((n = recv(fd, req + r, sizeof req - 1 - r, 0)) > 0) {
         r += n;
-        if (memchr(req, '\n', r)) break;
+        if (memchr(req, '\n', r)) break;            /* have the request line */
     }
-    if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) { close(fd); return; }
-    if (r == 0) { close(fd); return; }
-    req[r] = 0;
+    if (n <= 0) { close(fd); return; }              /* timeout / client quit */
+    req[r] = '\0';
 
+    /* -------- simple routing -------- */
     if (!strncmp(req, "GET /status", 11)) {
-        char body[BUF_SZ]; json_status(C, body);
+
+        char body[BUF_SZ];  json_status(C, body);
         http_send(fd, "application/json", body);
 
     } else if (!strncmp(req, "GET / ", 6)) {
+
         int f = open(C->g.html, O_RDONLY);
         if (f >= 0) {
-            struct stat st; fstat(f, &st);
-            char hdr[128]; int n = snprintf(hdr, sizeof hdr,
-                "HTTP/1.0 200 OK\r\nContent-Length: %zu\r\n"
-                "Content-Type: text/html\r\n\r\n", st.st_size);
-            send(fd, hdr, n, 0);
+            struct stat st;  fstat(f, &st);
+            char hdr[128];
+            int hlen = snprintf(hdr, sizeof hdr,
+                "HTTP/1.0 200 OK\r\n"
+                "Content-Length: %zu\r\n"
+                "Content-Type: text/html\r\n\r\n",
+                st.st_size);
+            send(fd, hdr, hlen, 0);
             while ((r = read(f, req, sizeof req)) > 0) send(fd, req, r, 0);
             close(f);
-        } else http_send(fd, "text/plain", "404\n");
-    } else http_send(fd, "text/plain", "404\n");
+        } else {
+            http_send(fd, "text/plain", "404\n");
+        }
+
+    } else {
+
+        http_send(fd, "text/plain", "404\n");
+    }
 
     close(fd);
 }
@@ -440,8 +457,14 @@ int main(int argc, char **argv)
             FD_ISSET(srv, &rset)) {
             int c = accept(srv, NULL, NULL);
             if (c >= 0) {
+                /* 1-second read timeout guards partial / malicious requests */
+                struct timeval rto = { 1, 0 };
+                setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &rto, sizeof rto);
+
+                /* leave the socket *blocking* but bounded */
                 int flags = fcntl(c, F_GETFL, 0);
                 fcntl(c, F_SETFL, flags & ~O_NONBLOCK);
+
                 handle(c, &C);
             }
         }
