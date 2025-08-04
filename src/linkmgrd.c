@@ -49,6 +49,7 @@ struct gcfg {
     char html[PATH_MAX];
     char master_if[32];
     char sta_poll_file[PATH_MAX];   /* ← new: external RSSI source */
+    char switch_cmd[PATH_MAX];             /* NEW: external hook */
 };
 struct sta {
     char ip[64];
@@ -115,6 +116,7 @@ static int ini_load(const char *fn, struct cfg *C)
             else if (!strcmp(k, "ping_succ_min"))      C->g.ping_succ_min = atoi(v);
             else if (!strcmp(k, "master_iface"))       strncpy(C->g.master_if, v, 31);
             else if (!strcmp(k, "sta_poll_file"))      strncpy(C->g.sta_poll_file, v, PATH_MAX - 1);
+            else if (!strcmp(k, "switch_cmd"))         strncpy(C->g.switch_cmd, v, PATH_MAX - 1);
 
         } else if (!strncmp(sec, "sta", 3)) {
             int i = C->nsta; if (i >= MAX_STA) continue;
@@ -280,13 +282,33 @@ static int route_is_ok(struct cfg *C, const char *gw)
         if (strstr(l, gw) && strstr(l, C->g.master_if)) { ok = 1; break; }
     pclose(p); return ok;
 }
+
+
+/* run the user-defined hook asynchronously; returns immediately */
+static void run_switch_cmd(struct cfg *C, const char *ip)
+{
+    if (!*C->g.switch_cmd) return;              /* feature disabled */
+
+    pid_t pid = fork();
+    if (pid == 0) {                             /* child → exec hook */
+        execl("/bin/sh", "sh", "-c",
+              "exec \"$0\" \"$1\"",
+              C->g.switch_cmd, ip, (char *)NULL);
+        _exit(127);                             /* exec failed */
+    }
+    /* parent ignores exit status (detached) */
+}
+
 static void route_watchdog(struct cfg *C)
 {
     if (!*C->via) return;
     if (route_is_ok(C, C->via)) return;
     if (g_verbose) fprintf(stderr, "[route] watchdog: repairing table\n");
     master_route(C, C->via);
+    run_switch_cmd(C, C->via);
 }
+
+
 
 /* ───────────────────────── decision engine ───────────────────────────── */
 static void decide(struct cfg *C)
@@ -320,6 +342,7 @@ static void decide(struct cfg *C)
         if (best_idx >= 0 && strcmp(C->via, C->s[best_idx].ip)) {
             strcpy(C->via, C->s[best_idx].ip);
             master_route(C, C->via);
+            run_switch_cmd(C, C->via);
             if (g_verbose)
                 printf("[force] keeping worst link via %s (raw rssi %d)\n",
                        C->via, best_raw);
@@ -344,6 +367,7 @@ static void decide(struct cfg *C)
                 if (!strcmp(cand, C->s[i].ip))
                     C->s[i].fail = C->s[i].succ = 0;
             master_route(C, cand);
+            run_switch_cmd(C, cand);
             if (g_verbose) printf("[switch] via %s (rssi %d)\n", cand, best);
             t0 = 0;
         }
@@ -456,6 +480,7 @@ int main(int argc, char **argv)
     C.g.ping_fail_max = 3;
     C.g.ping_succ_min = 2;
     C.txpwr      = -1;
+    C.g.switch_cmd[0] = '\0';              /* no hook by default */
     C.cck_fail   = C.ofdm_fail = C.fa = -1;
     for (int i = 0; i < MAX_STA; i++) C.s[i].retry = -1;
 
