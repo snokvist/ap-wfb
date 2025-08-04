@@ -16,6 +16,7 @@
 #include <stdbool.h>
 #include <sys/time.h>
 #include <getopt.h>
+#include <glob.h>
 
 #define MAX_STA   16
 #define MAC_LEN   18
@@ -168,8 +169,23 @@ int main(int argc,char *argv[])
         else if(o=='d')iface=optarg; else if(o=='v')verbose=true; else{ usage(argv[0]); return 1; }
     }
 
-    int n=load_cfg(cfg,macs,&intv,out,sizeof out,proc,sizeof proc);
-    if(n<=0){ fprintf(stderr,"No STA MACs\n"); return 1; }
+    int n = load_cfg(cfg, macs, &intv,
+                     out, sizeof out,
+                     proc, sizeof proc);          /* <-- proc may contain '*' */
+    if (n <= 0) { fprintf(stderr, "No STA MACs\n"); return 1; }
+
+    /* ---------- NEW: expand any wildcard in proc ---------------------- */
+    {
+        glob_t g;
+        if (glob(proc, 0, NULL, &g) == 0 && g.gl_pathc > 0) {
+            /* take the first match */
+            strncpy(proc, g.gl_pathv[0], sizeof proc);
+            if (verbose) fprintf(stderr, "[DBG] Resolved proc_path -> %s\n", proc);
+        } else {
+            fprintf(stderr, "[WARN] proc_path pattern '%s' matched nothing\n", proc);
+        }
+        globfree(&g);
+    }
 
     StaStats st[MAX_STA]; RxInfo rx; struct timeval last={0,0};
 
