@@ -353,9 +353,13 @@ static void decide(struct cfg *C)
 
     /* hysteresis window */
     char cand[64] = "";
-    for (int i = 0; i < C->nsta; i++)
-        if (best - EFFECTIVE_RSSI(C->s[i], *C) < C->g.hyst_db)
-            strncpy(cand, C->s[i].ip, 63);
+    for (int i = 0; i < C->nsta; i++) {
+        int er = EFFECTIVE_RSSI(C->s[i], *C);
+        if (best - er < C->g.hyst_db) {         /* first within window   */
+            strcpy(cand, C->s[i].ip);
+            break;                              /* ← stop overwriting    */
+        }
+    }
 
     long now = ms_now();
 
